@@ -148,6 +148,18 @@ bash build_linux.sh appimage # solo .AppImage
 bash build_linux.sh          # tutti e tre (default)
 ```
 
+> **Attenzione — CLI Tauri >= 2.12 per il bundle `.rpm`.** Le CLI Tauri < 2.12 usano
+> `rpm-rs 0.16`, che carica **tutto** il payload in RAM (nel nostro caso ~2,2 GB: sidecar
+> PyInstaller + torch + modello) e ne fa una copia: su una macchina con 7-8 GB di RAM il
+> processo entra in swap/thrashing e il `.rpm` non finisce mai (e di conseguenza non viene
+> prodotto nemmeno l'`.AppImage`, perché i bundle si generano in sequenza). Con
+> `@tauri-apps/cli >= 2.12` (rpm-rs 0.30, streaming) il `.rpm` esce in ~2 minuti.
+> `build_linux.sh` controlla la versione e si ferma con un messaggio chiaro.
+>
+> ```bash
+> cd tauri && npm install -D @tauri-apps/cli@^2.12.4   # aggiorna package.json + lockfile
+> ```
+
 ### Con Docker (consigliato: riproducibile, non sporca il sistema)
 
 `Dockerfile.linux` (root) crea un'immagine con tutta la toolchain + le dipendenze Python già

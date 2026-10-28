@@ -42,6 +42,23 @@ BUNDLES="${*:-deb rpm appimage}"           # bundle da produrre (es. "bash build
 command -v cargo >/dev/null || { echo "ERRORE: Rust/cargo non trovato (installa da https://rustup.rs)"; exit 1; }
 command -v npm   >/dev/null || { echo "ERRORE: npm non trovato (installa Node.js 18+)"; exit 1; }
 
+# La CLI Tauri < 2.12 usa rpm-rs 0.16, che carica TUTTO il payload in RAM:
+# con ~2,2 GB di risorse (sidecar PyInstaller + torch + modello) il bundle .rpm
+# impazzisce (swap/thrashing) e non finisce mai -> niente .rpm e niente .AppImage.
+# Il controllo definitivo gira dopo `npm install` (vedi passo 3).
+check_tauri_cli() {
+  local ver
+  ver="$(node -p "require('./node_modules/@tauri-apps/cli/package.json').version" 2>/dev/null || echo 0)"
+  if [ "$ver" = "0" ]; then
+    echo "ERRORE: @tauri-apps/cli non installato in tauri/ (esegui: cd tauri && npm install)"; exit 1
+  fi
+  if [ "$(printf '%s\n2.12.0\n' "$ver" | sort -V | head -1)" != "2.12.0" ]; then
+    echo "ERRORE: @tauri-apps/cli $ver troppo vecchia per il bundle .rpm."
+    echo "       Serve >= 2.12 (rpm-rs 0.30, streaming): cd tauri && npm install -D @tauri-apps/cli@^2.12.4"
+    exit 1
+  fi
+}
+
 # ---- 1) venv CPU + dipendenze (come docs/BUILD.md, ma su Linux) ------------
 if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
@@ -65,6 +82,7 @@ fi
 # ---- 3) build Tauri: override bundle a deb + rpm + appimage (la conf di default è nsis) ----
 cd tauri
 npm install
+check_tauri_cli
 npx tauri build --bundles $BUNDLES
 
 echo
