@@ -411,12 +411,13 @@ service is ready. While the model loads, `/health` answers `503`.
 python src/app/app.py --port 8080                  # listen on another port
 python src/app/app.py --exclude-tags AGE,GENDER     # leave some tags in the clear
 python src/app/app.py --no-mapping                 # irreversible: no restore dictionary
+python src/app/app.py --no-ocr                     # don't OCR the scanned PDFs
 
 PII_MODEL_DIR=/path/to/model python src/app/app.py  # use a model in another folder
 ```
 
 Precedence for the anonymization preferences is **request field > CLI flag > environment
-(`PII_EXCLUDE_TAGS`, `PII_MAPPING`) > `prefs.json` > default**; for host/port it is
+(`PII_EXCLUDE_TAGS`, `PII_MAPPING`, `PII_OCR`) > `prefs.json` > default**; for host/port it is
 **CLI > environment (`PII_HOST`, `PII_PORT`) > `config.json` > `127.0.0.1:5005`**.
 
 #### Headless mode (backend of the Tauri app)
@@ -428,8 +429,8 @@ python src/app/serve.py                 # same server, no browser is opened
 This is the mode the Tauri desktop app talks to; it is also handy behind a reverse proxy.
 
 > Running from source is enough for everything the app offers: text and PDF anonymization,
-> previews, the reversible dictionary, and the `/pii-zones`, `/analyze-with-zones` and
-> `/ocr-zones` endpoints.
+> previews, the reversible dictionary, the **built-in OCR** for scanned PDFs, and the
+> `/pii-zones`, `/analyze-with-zones` and `/ocr-zones` endpoints.
 
 ### One document, from the CLI
 
@@ -592,7 +593,88 @@ curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
 
 ---
 
+## OCR on scanned documents (built in)
+
+A **scan** is a PDF whose text lives inside an image: there is no text layer, so the
+text-layer redaction cannot act on it. rizzo-pii now recognises that case **on its own**
+and runs an OCR engine for you:
+
+- the page is rendered (200 DPI) and handed to the OCR engine;
+- the recognised text enters the analysis like any other text → the scan becomes
+  anonymizable, with the same model and the same regex/checksum net;
+- the anonymized PDF is produced by **burn-in**: the page is rasterized and the PII
+  boxes are painted **inside the pixels**, so the original scan (and the PII inside it)
+  is not recoverable from the file. The placeholder is written on top of the box.
+
+> Nothing leaves the machine: the OCR runs locally, like everything else.
+
+### Install an engine (optional)
+
+The app works exactly as before without an engine — it just tells you that a scan
+needs one. Two engines are supported, the first available wins:
+
+| Engine | How to install | Notes |
+|---|---|---|
+| **Tesseract** (recommended) | `apt install tesseract-ocr tesseract-ocr-ita` · `brew install tesseract tesseract-lang` · [UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) on Windows | A system binary, no Python package. Best quality, **word-level** boxes: the redaction covers the exact word |
+| **RapidOCR / ONNX** | `pip install rapidocr-onnxruntime` | Pure pip, no system binary, the only one that can be bundled inside the desktop app. Recognises **lines**, so the redaction covers the whole line (safe, but it hides more context) |
+
+```bash
+pip install rapidocr-onnxruntime      # or install Tesseract as a system package
+```
+
+Which engine is available is shown in the UI (next to the *OCR automatico* switch) and
+in `GET /health`:
+
+```bash
+curl http://127.0.0.1:5005/health
+# {"ocr": {"available": true, "engine": "onnx", "detail": "RapidOCR/ONNX"}, "ocr_enabled": true, ...}
+```
+
+### Turn it off
+
+OCR is **automatic**, but it is a switch like the others:
+
+- UI: the *OCR automatico* switch in the input card (persisted in `prefs.json`);
+- API: `POST /settings {"ocr_enabled": false}`;
+- env: `PII_OCR=0` (takes precedence at startup);
+- CLI: `python src/app/app.py --no-ocr`.
+
+### What the API answers
+
+`POST /analyze`, `POST /preview` and `POST /pdf/preview` return an `ocr` block when
+the OCR was used:
+
+```json
+{"ocr": {"engine": "onnx", "dpi": 200, "lang": "ita+eng", "pages": 2,
+         "page_numbers": [1, 2], "seconds": 6.4, "chars": 3187}}
+```
+
+If a scan arrives and the OCR cannot run, the answer is explicit instead of silent:
+
+| `code` | Meaning |
+|---|---|
+| `ocr_unavailable` | no engine installed — the message says what to install |
+| `ocr_disabled` | the switch is off |
+| `ocr_failed` | the engine failed (timeout, unreadable page) |
+
+### Limits (deliberate)
+
+- the OCR runs in-process and **blocks** the request: a 40-page scan takes a while
+  (≈3–5 s/page with RapidOCR, ≈1–2 s/page with Tesseract). The cap is 40 pages
+  per document (`OCR_MAX_PAGES`);
+- the burn-in **rasterizes** the page: in a redacted scan the text is no longer
+  selectable (the placeholders are);
+- an OCR error is an OCR error: a misread digit in an IBAN means a wrong placeholder.
+  Check the result, as always.
+
+---
+
 ## PII zones extraction for OCR (scanned documents)
+
+> This section describes the **external** OCR workflow (you drive your own engine:
+> Tesseract, PaddleOCR, AWS Textract, Google Vision). If you just want the app to
+> handle the scans itself, use the **built-in OCR** described above — the endpoints
+> below stay there for the cases where you want to plug your own engine in.
 
 When a PDF is a **scan** (raster images, no text layer), the text-layer redaction cannot work — the endpoint fails with `422`. To handle this, rizzo-pii exposes endpoints that return **precise geometric coordinates** (bounding boxes) of every detected PII, so you can feed only those regions to an external OCR engine (Tesseract, PaddleOCR, AWS Textract, Google Vision, etc.) and merge the results back.
 
@@ -680,11 +762,12 @@ rizzo_pii/
 │   └─ app/                           local anonymization app
 │       ├─ app.py                     Flask server: reversible anonymization + regex/checksum net
 │       ├─ pdf_export.py              anonymized-PDF download: true redaction of the uploaded PDF
+│       ├─ ocr.py                     OCR engine (Tesseract / RapidOCR-ONNX) for scanned PDFs
 │       ├─ pdf_text.py                readable text extraction (pages + annotations + widgets + TOC)
 │       ├─ detectors.py               regex+checksum net (standalone, no torch/fitz)
 │       ├─ serve.py                   headless entry (backend of the Tauri app, no browser)
 │       ├─ desktop_app.py             legacy PyInstaller entry (opens the browser)
-│       ├─ server_config.py           host/port config + prefs.json (excluded tags, mapping)
+│       ├─ server_config.py           host/port config + prefs.json (excluded tags, mapping, OCR)
 │       └─ assets/                    mascot (the hedgehog) and icons
 ├─ tauri/                    native desktop app (Tauri) + Windows installer — see docs/BUILD.md
 ├─ dataset/                  (gitignored — regenerable from the scripts)
@@ -713,6 +796,11 @@ Stated plainly:
   sentences, whereas the real use case is whole documents. Measuring true end-to-end behaviour
   (long context, PDF chunking with overlap, real act structure) needs a dedicated test set of
   large, real Italian documents, which still has to be assembled.
+- **OCR is only as good as the engine, and it is not free.** Scanned PDFs are handled by the
+  built-in OCR (see above), but the recognition errors are the OCR's: a misread digit becomes a
+  wrong placeholder. The redaction of a scan is also a *burn-in*: the page is rasterized, so in a
+  redacted scan the text is no longer selectable, and with the ONNX engine the whole recognized
+  line is covered (Tesseract covers the exact word).
 
 The mitigation that matters in practice: **always pair the model with the regex/checksum safety
 net** (`src/inspect/validate_checksums.py` is the blueprint). The two together are stronger than

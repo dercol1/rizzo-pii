@@ -17,6 +17,24 @@ datas += [("models/rizzo-pii-0.3B-v1.5.0", "pii_model")]
 datas += [("src/app/assets", "assets")]   # mascotte/icone -> app.py le serve da _resource_path("assets")
 hiddenimports += ["fitz", "flask", "sklearn.utils._typedefs"]
 
+# OCR opzionale (serve solo per i PDF SCANNIONATI, senza layer testuale).
+# Se rapidocr-onnxruntime e' installato nell'env di build viene impacchettato
+# (modelli ONNX ~13 MB + onnxruntime ~68 MB). Se non e' installato la build
+# resta identica a prima: l'app funziona e, sui documenti scansionati, dice
+# che serve un motore OCR. Non e' un errore: e' una scelta.
+try:
+    import importlib.util as _ilu
+
+    if _ilu.find_spec("rapidocr_onnxruntime") is not None:
+        for pkg in ("rapidocr_onnxruntime", "onnxruntime"):
+            d, b, h = collect_all(pkg)
+            datas += d
+            binaries += b
+            hiddenimports += h
+        print("[build] OCR: rapidocr-onnxruntime impacchettato")
+except Exception as _e:
+    print(f"[build] OCR non impacchettato ({_e})")
+
 # escludi tutto cio' che non serve (riduce dimensione e rumore)
 excludes = [
     "tensorflow", "tensorflow_intel", "tf_keras", "keras", "jax", "jaxlib", "flax",

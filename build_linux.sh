@@ -48,6 +48,12 @@ if [ ! -d "$VENV" ]; then
   "$VENV/bin/pip" install --upgrade pip
   "$VENV/bin/pip" install --index-url https://download.pytorch.org/whl/cpu torch
   "$VENV/bin/pip" install "transformers==4.57.3" tokenizers safetensors flask pymupdf pyinstaller
+  # OCR opzionale per i PDF scansionati: se si installa, il pacchetto finisce
+  # dentro il sidecar (build_sidecar.spec lo raccoglie solo se e' presente).
+  # Se fallisce la build prosegue: l'app funziona, ma sui documenti scansionati
+  # avvisa che serve un motore OCR.
+  "$VENV/bin/pip" install rapidocr-onnxruntime \
+    || echo "AVVERTENZA: OCR non impacchettato (rapidocr-onnxruntime non installato)"
 fi
 
 # ---- 2) sidecar PyInstaller -> tauri/src-tauri/backend/pii-backend/pii-backend ----

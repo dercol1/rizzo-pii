@@ -148,6 +148,7 @@ rizzo-pii/
 │   └─ app/                             # App anonimizzazione locale
 │       ├─ app.py                       # Flask server: anonimizzazione + regex/checksum
 │       ├─ pdf_export.py                # PDF anonimizzato: redazione vera
+│       ├─ ocr.py                       # OCR integrato (Tesseract / RapidOCR-ONNX)
 │       ├─ pdf_text.py                  # Estrazione testo leggibile (pagine+annot+widget+TOC)
 │       ├─ detectors.py                 # Rete regex+checksum (standalone, testabile)
 │       ├─ serve.py                     # Entry headless (backend Tauri)
@@ -669,6 +670,8 @@ Output: installer NSIS per-utente (Windows), `.dmg` firmato/notarizzato (macOS),
 | `test_source_text.py` | Gestione source_text |
 | `test_server_config.py` | Config server/prefs |
 | `test_codifiche.py` | Gestione encoding (utf-16, cp1252, latin-1) |
+| `test_ocr_scansione.py` | OCR integrato: scansioni, coordinate, burn-in |
+| `test_ocr_app.py` | OCR integrato via API (`/analyze`, `/pdf`, `/health`) |
 
 ### Esecuzione Test
 
@@ -902,7 +905,94 @@ Combina `/analyze` + `/pii-zones` in una sola chiamata per evitare doppio proces
 - [ ] Allineamento automatico coordinate OCR → offset globali testo
 - [ ] Endpoint `/redact-zones` per redarre solo zone specifiche (bbox)
 - [ ] Supporto coordinate in pixel (oltre che punti PDF normalizzati)
-- [ ] Integrazione diretta con motori OCR popolari (Tesseract, PaddleOCR)
+- [ ] Integrazione diretta con motori OCR popolari (Tesseract, PaddleOCR) → **fatto: vedi "OCR integrato" sotto**
+
+---
+
+## OCR Integrato per i PDF Scansionati
+
+### Problema
+
+Un PDF scansionato ha la PII dentro un'immagine: non c'è layer testuale, quindi
+`page.get_text()` torna vuoto, `analyze()` non trova nulla e la redazione vettoriale
+(`apply_redactions()`) non ha niente su cui agire. Prima di questa feature l'app
+rispondeva `422` e lasciava all'utente il compito di arrangiarsi con un OCR esterno.
+
+### Soluzione
+
+`src/app/ocr.py` (modulo standalone, niente torch/transformers) + due hook in `app.py`:
+
+```
+app._extract_document_text(name, bytes) -> (testo, meta)
+   ├─ PDF con layer testuale  -> pdf_text.collect_readable_text(doc)   (comportamento di sempre)
+   └─ PDF con pagine scansionate
+        ├─ ocr.scanned_pages(doc)   -> [indici delle pagine senza testo utile]
+        ├─ ocr.ocr_pdf(bytes, pages=[...])  -> testo riconosciuto + box
+        └─ testo = layer testuale delle altre pagine + testo OCR delle scansionate
+```
+
+**Riconoscimento della scansione** (`ocr.scanned_pages`): una pagina è "scansionata" se ha
+meno di `OCR_MIN_CHARS_PER_PAGE` (20) caratteri di testo **E** ha qualcosa disegnato
+(immagine o vettori). Una pagina bianca non è una scansione: è vuota, e non c'è niente da
+riconoscere.
+
+**Motori** (plug-in, il primo disponibile vince):
+
+| Motore | Installazione | Granularità del box | Note |
+|---|---|---|---|
+| `tesseract` | binario di sistema (`tesseract-ocr` + `tesseract-ocr-ita`) | **parola** | qualità migliore; l'output TSV dà le coordinate di ogni parola |
+| `onnx` | `pip install rapidocr-onnxruntime` | **riga** | nessun binario, unico impacchettabile in Tauri/PyInstaller |
+
+Il contratto di un motore (`ocr._Engine.recognize(png) -> [righe]`) è una riga = testo +
+rettangolo in **pixel**; `ocr.py` converte i pixel in punti PDF (`72/dpi`) e tiene gli
+**offset del testo** di ogni riga, così il matching delle PII sulla pagina OCR usa gli
+stessi pattern char-precisi del layer testuale (`pdf_export._value_pattern`).
+
+**Redazione delle scansioni** (`pdf_export.redact_pdf_ocr`): la pagina non può essere
+redatta in vettore, quindi viene **rasterizzata** e le caselle vengono annerite **dentro
+i pixel**:
+
+```
+pagina sorgente → pixmap (200 DPI) → pagina temporanea con le caselle disegnate
+               → rasterizzazione FINALE → pagina del PDF di output (immagine + placeholder)
+```
+
+La doppia rasterizzazione è il punto: i pixel originali della scansione **non restano nel
+file** (se le caselle fossero solo disegnate sopra, la PII sarebbe recuperabile dal
+content stream). Il placeholder è scritto come testo vettore sopra la casella, quindi
+resta selezionabile e cercabile.
+
+### Configurazione
+
+| Livello | Come |
+|---|---|
+| UI | switch "OCR automatico" nella card di input (accanto a quello del dizionario) |
+| API | `POST /settings {"ocr_enabled": false}` |
+| prefs | `prefs.json` → `{"ocr_enabled": true}` |
+| env | `PII_OCR=0` (prevalenza all'avvio) |
+| CLI | `python src/app/app.py --no-ocr` |
+| `/health` | `{"ocr": {"available": true, "engine": "onnx", "detail": "..."}, "ocr_enabled": true}` |
+
+### Cache
+
+Il risultato dell'OCR è cachato **in memoria** (`app._OCR_CACHE`, 3 voci, chiave = SHA-256
+dei byte del PDF): `/preview`, `/analyze` e `/pdf/preview` ricevono lo stesso file e non
+riconoscono due volte le stesse pagine. Mai su disco.
+
+### Limiti (deliberati)
+
+- l'OCR gira **in processo** e blocca la richiesta: ~3-5 s/pagina con RapidOCR, ~1-2 s
+  con Tesseract; tetto di `OCR_MAX_PAGES` (40) pagine per documento;
+- la pagina rasterizzata **non ha più testo selezionabile** (solo i placeholder);
+- con il motore ONNX la casella copre **tutta la riga** riconosciuta (con Tesseract la
+  parola esatta): over-redazione, ma la PII è certamente coperta.
+
+### Test
+
+- `tests/test_ocr_scansione.py` — riconoscimento della scansione, coordinate, burn-in
+  (verifica **del pixel**: sotto la PII non deve più esserci bianco);
+- `tests/test_ocr_app.py` — `/analyze` e `/pdf` su un PDF scansionato, errori
+  `ocr_unavailable` / `ocr_disabled`, `/health` e `/settings`.
 
 ---
 
@@ -954,7 +1044,10 @@ class _ReqError(Exception):
 | Modello non trovato all'avvio | `MODEL_DIR` sbagliato | Controlla `APP_MODEL_VERSION` e `models/registry.json` |
 | Porta occupata all'avvio Tauri | Altra istanza gira | Tauri mostra form configurazione (codice uscita 76) |
 | PDF protetto da password | `doc.needs_pass` | UI segnala errore "PDF protetto: rimuovi protezione" |
-| Nessuna occorrenza in PDF scansione | Layer testuale vuoto | Errore 422: serve OCR → nuova feature `/pii-zones` |
+| Nessuna occorrenza in PDF scansione | Layer testuale vuoto | OCR automatico: serve un motore (`pip install rapidocr-onnxruntime` o Tesseract di sistema) |
+| `400 ocr_unavailable` | Nessun motore OCR installato | `pip install rapidocr-onnxruntime` oppure installa Tesseract (`tesseract-ocr` + `tesseract-ocr-ita`) |
+| `400 ocr_disabled` | Switch "OCR automatico" disattivato | Riattivalo nella UI, o `POST /settings {"ocr_enabled": true}`, o togli `PII_OCR=0` |
+| L'OCR è lento su un documento lungo | L'OCR gira in processo, bloccando la richiesta | Tetto di 40 pagine per documento; usa Tesseract (più veloce) |
 | Valori residui in output | Matching fallito (sillabazione, encoding) | Controlla `X-PII-Residual` header; pattern `_value_pattern` |
 | "DE" redatto dentro "CORDELLA" | Confini parola non rispettati | `_value_pattern` usa `(?<!\w)...(?!\w)` |
 | IBAN troncato / coda in chiaro | Regex non copre formato stampa | Usa `detect_iban()` scanner (non regex) con `IBAN_LEN` |

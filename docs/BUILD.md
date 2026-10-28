@@ -323,3 +323,60 @@ con shortcut nel menu Start e disinstallazione.
   (consigliato solo dopo che tutto funziona).
 - **SmartScreen**: un exe non firmato mostra l'avviso "editore sconosciuto". Per la distribuzione
   serve un certificato di code signing.
+
+---
+
+## OCR (opzionale) nel pacchetto desktop
+
+L'app riconosce da sola i PDF **scansionati** (senza layer testuale) e li anonimizza
+vedi **[README → OCR on scanned documents](../README.md#ocr-on-scanned-documents-built-in)**.
+Per farlo serve un **motore OCR**: senza, l'app funziona esattamente come prima e, quando
+incontra una scansione, dice cosa installare. Ci sono due strade, non si escludono a vicenda.
+
+### A) RapidOCR/ONNX — impacchettato (consigliato per la distribuzione)
+
+È un pacchetto Python puro, niente binari di sistema:
+
+```bash
+build_env/bin/pip install rapidocr-onnxruntime   # ~80 MB (onnxruntime + modelli)
+```
+
+- `build.spec` e `build_sidecar.spec` lo raccolgono **solo se è presente nell'env di build**
+  (blocco commentato "OCR opzionale" in entrambi gli spec): nel pacchetto finiscono i modelli
+  ONNX (~13 MB: det + rec + cls) e `onnxruntime` (~68 MB).
+- `build_linux.sh`, `build_macos.sh` e il workflow **Windows** (`build-windows.yml`) lo
+  installano già: se l'installazione fallisce la build **prosegue senza OCR** (l'app resta
+  utilizzabile e avvisa).
+- Pro: nessuna dipendenza esterna, l'OCR funziona su qualunque PC che installa l'app.
+- Contro: riconosce **per riga**, quindi la redazione copre la riga intera (per eccesso).
+
+### B) Tesseract — installazione di sistema (qualità migliore)
+
+Non è un pacchetto Python: è un programma.
+
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-ita   # Debian/Ubuntu
+sudo dnf install tesseract tesseract-lang         # Fedora
+brew install tesseract tesseract-lang             # macOS
+# Windows: installer "UB Mannheim" (https://github.com/UB-Mannheim/tesseract/wiki)
+```
+
+- L'app lo cerca in quest'ordine: variabile d'ambiente `PII_TESSERACT`, `PATH`, poi le
+  cartelle standard (`C:\Program Files\Tesseract-OCR`, `%LOCALAPPDATA%\Tesseract-OCR`).
+- Se è presente **ha la precedenza** su RapidOCR e restituisce le parole con le loro
+  coordinate → la redazione copre la parola esatta, non la riga.
+- **Non viene incluso nell'installer**: va installato sul PC dell'utente. Copiarlo a mano
+  dentro il pacchetto (binario + `tessdata`) non è supportato ufficialmente.
+
+### Verificare cosa c'è nel pacchetto
+
+```bash
+curl -s http://127.0.0.1:5005/health | python3 -m json.tool | grep -A3 '"ocr"'
+```
+
+- Con OCR: `"ocr": {"available": true, "engine": "onnx"}` (o `"tesseract"`).
+- Senza OCR: `"available": false` — l'app funziona, ma sui documenti scansionati risponde
+  `400` con `code: "ocr_unavailable"` e le istruzioni per installarlo.
+
+Lo switch **"OCR automatico"** nella UI (e `ocr_enabled` in `prefs.json`, `PII_OCR=0`,
+`--no-ocr`) disattiva il riconoscimento automatico: l'OCR parte solo se richiesto a mano.

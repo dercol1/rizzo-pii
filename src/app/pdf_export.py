@@ -349,22 +349,15 @@ REDACT_FILL = (0.486, 0.227, 0.620)
 REDACT_TEXT = (1.0, 1.0, 1.0)
 
 
-def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
-    """PDF originale -> PDF con redazione vera + placeholder al posto delle PII.
+def _prepare_items(mapping):
+    """Preparazione comune a redact_pdf e redact_pdf_ocr.
 
-    mapping: {"[FULLNAME_1]": "Mario Rossi", ...} (il dizionario di analyze()).
-    Ritorna (bytes, report) con report = {
-        "occurrences":    occorrenze redatte nel testo di pagina,
-        "by_placeholder": {placeholder: n_occorrenze},
-        "not_found":      placeholder cercati ma senza occorrenze di pagina,
-        "skipped":        placeholder NON cercati perche' troppo corti/ambigui
-                          (restano in chiaro: va segnalato all'utente),
-        "residual":       placeholder ancora leggibili nell'output (deve essere []),
-        "annots":         sostituzioni nelle annotazioni,
-        "widgets":        sostituzioni nei campi modulo,
-        "toc":            sostituzioni nei segnalibri,
-        "embedded":       allegati rimossi,
-    }
+    Ritorna (items, skipped, usable, by_ph, patterns):
+      items    -> [(placeholder, valore)] come sono nel dizionario
+      skipped  -> placeholder troppo corti/ambigui (NON cercati: restano in chiaro)
+      usable   -> [(placeholder, valore, pattern)] cercabili nel documento
+      by_ph    -> {placeholder: n_occorrenze}
+      patterns -> [(pattern, placeholder)] per annotazioni/widget/TOC
     """
     if not isinstance(mapping, dict) or not mapping:
         raise PdfError("Dizionario vuoto: anonimizza prima il documento.")
@@ -372,14 +365,6 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
              if isinstance(ph, str) and isinstance(v, str) and v.strip()]
     if not items:
         raise PdfError("Dizionario non valido.")
-
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        raise PdfError("File PDF non valido o danneggiato.")
-    if doc.needs_pass:
-        doc.close()
-        raise PdfError("PDF protetto da password: rimuovi la protezione e riprova.")
 
     # valori lunghi per primi: cosi' "Rossi" non spezza la redazione di
     # "Mario Rossi" (i rect gia' coperti vengono saltati da _covered)
@@ -398,30 +383,40 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
 
     by_ph = {ph: 0 for ph, _, _ in usable}
     patterns = [(pat, ph) for ph, _, pat in usable]   # per annot/widget/TOC
+    return items, skipped, usable, by_ph, patterns
+
+
+def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
+    """PDF originale -> PDF con redazione vera + placeholder al posto delle PII.
+
+    mapping: {"[FULLNAME_1]": "Mario Rossi", ...} (il dizionario di analyze()).
+    Ritorna (bytes, report) con report = {
+        "occurrences":    occorrenze redatte nel testo di pagina,
+        "by_placeholder": {placeholder: n_occorrenze},
+        "not_found":      placeholder cercati ma senza occorrenze di pagina,
+        "skipped":        placeholder NON cercati perche' troppo corti/ambigui
+                          (restano in chiaro: va segnalato all'utente),
+        "residual":       placeholder ancora leggibili nell'output (deve essere []),
+        "annots":         sostituzioni nelle annotazioni,
+        "widgets":        sostituzioni nei campi modulo,
+        "toc":            sostituzioni nei segnalibri,
+        "embedded":       allegati rimossi,
+    }
+    """
+    items, skipped, usable, by_ph, patterns = _prepare_items(mapping)
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        raise PdfError("File PDF non valido o danneggiato.")
+    if doc.needs_pass:
+        doc.close()
+        raise PdfError("PDF protetto da password: rimuovi la protezione e riprova.")
+
     total = n_annots = n_widgets = 0
 
     for page in doc:
-        text, boxes = _page_char_index(page)
-        taken = []
-        if text.strip():
-            for ph, val, pat in usable:
-                for m in pat.finditer(text):
-                    rects = _match_rects(boxes, m)
-                    placed_any, labeled = False, False
-                    for r in rects:
-                        if _covered(r, taken):
-                            continue
-                        fs = 0 if labeled else _fit_fontsize(ph, r)
-                        _add_redact_annot(page, r, ph if fs else None,
-                                          fs or 6, fill, text_color)
-                        taken.append(fitz.Rect(r))
-                        placed_any = True
-                        labeled = labeled or bool(fs)
-                    if placed_any:
-                        by_ph[ph] += 1
-                        total += 1
-        if taken:
-            page.apply_redactions()   # rimozione VERA dal content stream
+        total += _redact_page_vector(page, usable, by_ph, fill, text_color)
         # dopo le redazioni: annotazioni e campi modulo non sono content stream
         n_annots += _scrub_annots(page, patterns)
         n_widgets += _scrub_widgets(page, patterns)
@@ -444,6 +439,222 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
         "toc": n_toc,
         "embedded": n_emb,
     }
+
+
+def _redact_page_vector(page, usable, by_ph, fill=REDACT_FILL, text_color=REDACT_TEXT):
+    """Redazione VERA del layer testuale di una pagina (content stream).
+
+    Ritorna il numero di occorrenze redatte. Stessa logica di sempre: il
+    matching e' char-preciso e con confini di parola, e il testo viene rimosso
+    dal content stream con apply_redactions().
+    """
+    text, boxes = _page_char_index(page)
+    total = 0
+    taken = []
+    if text.strip():
+        for ph, val, pat in usable:
+            for m in pat.finditer(text):
+                rects = _match_rects(boxes, m)
+                placed_any, labeled = False, False
+                for r in rects:
+                    if _covered(r, taken):
+                        continue
+                    fs = 0 if labeled else _fit_fontsize(ph, r)
+                    _add_redact_annot(page, r, ph if fs else None,
+                                      fs or 6, fill, text_color)
+                    taken.append(fitz.Rect(r))
+                    placed_any = True
+                    labeled = labeled or bool(fs)
+                if placed_any:
+                    by_ph[ph] += 1
+                    total += 1
+    if taken:
+        page.apply_redactions()   # rimozione VERA dal content stream
+    return total
+
+
+# --------------------------------------------------------------------------- #
+# Redazione delle pagine SCANSIONATE (burn-in)
+#
+# In una scansione la PII e' nel pixel, non nel content stream: nessuna
+# redazione vettoriale la puo' toccare. Qui la pagina viene RASTERIZZATA e i
+# rettangoli delle PII vengono anneriti dentro i pixel stessi (non disegnati
+# sopra: sopra i pixel originali resterebbero nel file e la PII sarebbe
+# recuperabile con un pizzico di zucchero). L'originale sparisce, il risultato
+# e' un PDF di immagini con i placeholder scritti sopra.
+# --------------------------------------------------------------------------- #
+def _ocr_rects(lines, start, end):
+    """Rettangoli (in punti PDF) che coprono l'intervallo [start, end) del testo OCR."""
+    rects = []
+    for ln in lines:
+        s, e = ln.get("start", 0), ln.get("end", 0)
+        if e <= start or s >= end:
+            continue
+        r = fitz.Rect(ln.get("x0", 0), ln.get("y0", 0),
+                      ln.get("x1", 0), ln.get("y1", 0))
+        if not r.is_empty:
+            rects.append(r)
+    return rects
+
+
+def _ocr_page_redactions(ocr_page, usable, by_ph):
+    """Le occorrenze da coprire in una pagina OCR: [(rect, placeholder)].
+
+    Il testo della pagina e' lo stesso che e' stato analizzato (e' l'OCR), quindi
+    il matching dei valori e' identico a quello del layer testuale: stessi
+    pattern, stessi confini di parola.
+    """
+    text = ocr_page.get("text") or ""
+    lines = ocr_page.get("lines") or []
+    out, taken = [], []
+    if not text.strip():
+        return out
+    for ph, val, pat in usable:
+        for m in pat.finditer(text):
+            rects = _ocr_rects(lines, m.start(), m.end())
+            placed = False
+            for r in rects:
+                if _covered(r, taken):
+                    continue
+                taken.append(fitz.Rect(r))
+                out.append((fitz.Rect(r), ph))
+                placed = True
+            if placed:
+                by_ph[ph] += 1
+    return out
+
+
+def _raster_page(page, dpi):
+    """Pagina rasterizzata: [pixmap, rettangoli delle PII] -> la pagina intera
+    viene resa immagine, quindi i pixel originali non restano nel file."""
+    pix = page.get_pixmap(dpi=dpi)
+    if pix.colorspace is None or pix.n - pix.alpha not in (1, 3):
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    return pix
+
+
+def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
+                   text_color=REDACT_TEXT):
+    """PDF con pagine scansionate -> PDF anonimizzato (burn-in sulle scansioni).
+
+    `ocr` e' il risultato di `ocr.ocr_pdf`: {"pages": [{"page": n, "text": ...,
+    "lines": [{"text", "x0", "y0", "x1", "y1", "start", "end"}]}]}.
+
+    Le pagine con OCR vengono rasterizzate e annerite; le altre (layer testuale)
+    vengono redatte come sempre, in vettore. Il risultato e' un PDF misto.
+
+    ATTENZIONE (perdita di qualita' deliberata): la pagina rasterizzata non ha
+    piu' il testo selezionabile. E' il prezzo della privacy: i pixel originali
+    della scansione non restano nel file.
+    """
+    items, skipped, usable, by_ph, patterns = _prepare_items(mapping)
+    ocr_pages = {p.get("page"): p for p in (ocr or {}).get("pages", [])}
+
+    try:
+        src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        raise PdfError("File PDF non valido o danneggiato.")
+    if src.needs_pass:
+        src.close()
+        raise PdfError("PDF protetto da password: rimuovi la protezione e riprova.")
+
+    out_doc = fitz.open()
+    total = 0
+    try:
+        for i in range(src.page_count):
+            page = src.load_page(i)
+            op = ocr_pages.get(i)
+            if op is None:
+                # pagina con layer testuale: redaction vettoriale come sempre
+                try:
+                    out_doc.insert_pdf(src, from_page=i, to_page=i)
+                except Exception:
+                    out_doc.insert_pdf(src, from_page=i, to_page=i,
+                                       annots=False, links=False)
+                p2 = out_doc.load_page(out_doc.page_count - 1)
+                total += _redact_page_vector(p2, usable, by_ph, fill, text_color)
+                continue
+
+            # pagina scansionata: raster + caselle nere dentro i pixel
+            hits = _ocr_page_redactions(op, usable, by_ph)
+            total += _count_ocr_matches(op, usable)
+            tmp = fitz.open()
+            try:
+                tp = tmp.new_page(width=page.rect.width, height=page.rect.height)
+                pix = _raster_page(page, dpi)
+                tp.insert_image(tp.rect, pixmap=pix)
+                for r, _ph in hits:
+                    black = fitz.Rect(r.x0 - 1, r.y0 - 0.5, r.x1 + 1, r.y1 + 0.5)
+                    tp.draw_rect(black, color=None, fill=fill)
+                # rasterizzo ANCHE le caselle: i pixel originali non restano nel file
+                pix2 = tp.get_pixmap(dpi=dpi)
+            finally:
+                tmp.close()
+
+            np_ = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+            np_.insert_image(np_.rect, pixmap=pix2)
+            for r, ph in hits:
+                fs = _fit_fontsize(ph, r)
+                if fs:
+                    _insert_placeholder(np_, r, ph, fs, text_color)
+    finally:
+        src.close()
+
+    n_annots = n_widgets = 0
+    for page in out_doc:
+        n_annots += _scrub_annots(page, patterns)
+        n_widgets += _scrub_widgets(page, patterns)
+    n_toc = _scrub_toc(out_doc, patterns)
+    n_emb = _strip_embedded(out_doc)
+    _scrub_metadata(out_doc)
+    out = out_doc.tobytes(garbage=3, deflate=True)
+    out_doc.close()
+
+    checked = [(ph, v) for ph, v in items if ph in by_ph]
+    return out, {
+        "occurrences": total,
+        "by_placeholder": by_ph,
+        "not_found": [ph for ph, n in by_ph.items() if n == 0],
+        "skipped": skipped,
+        "residual": _verify_residuals(out, checked),
+        "annots": n_annots,
+        "widgets": n_widgets,
+        "toc": n_toc,
+        "embedded": n_emb,
+        "ocr_pages": sorted(ocr_pages),
+    }
+
+
+def _insert_placeholder(page, rect, ph, fontsize, color):
+    """Scrive il placeholder dentro il rettangolo, centrato.
+
+    Non si usa insert_textbox: se il testo non entra nel rettangolo (la
+    casella OCR e' alta quanto la riga riconosciuta) insert_textbox NON
+    scrive niente e restituisce un codice negativo. Qui la larghezza e'
+    calcolata a mano e la baseline centrata: il placeholder c'e' sempre, e
+    il testo resta selezionabile nella pagina rasterizzata.
+    """
+    try:
+        w = fitz.get_text_length(ph, fontname="helv", fontsize=fontsize)
+    except Exception:
+        w = 0
+    x = rect.x0 + max(0.0, (rect.width - w) / 2.0)
+    y = rect.y0 + (rect.height + fontsize * 0.72) / 2.0
+    try:
+        page.insert_text((x, y), ph, fontname="helv", fontsize=fontsize, color=color)
+    except Exception:
+        pass
+
+
+def _count_ocr_matches(ocr_page, usable):
+    """Occorrenze (match) trovate nel testo OCR di una pagina."""
+    text = ocr_page.get("text") or ""
+    n = 0
+    if not text.strip():
+        return 0
+    for _ph, _val, pat in usable:
+        n += sum(1 for _ in pat.finditer(text))
+    return n
 
 
 def _add_redact_annot(page, rect, text, fontsize, fill, text_color):

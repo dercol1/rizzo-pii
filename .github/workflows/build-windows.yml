@@ -73,6 +73,11 @@ jobs:
           pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir "transformers==4.57.3" tokenizers safetensors `
             flask pymupdf pyinstaller "huggingface_hub[cli]"
+          # OCR opzionale per i PDF scansionati: se si installa, rapidocr-onnxruntime
+          # viene impacchettato nel sidecar (build_sidecar.spec). Se fallisce la
+          # build prosegue senza OCR (l'app avvisa che serve un motore).
+          pip install --no-cache-dir rapidocr-onnxruntime `
+            || echo "AVVERTENZA: OCR non impacchettato (rapidocr-onnxruntime non installato)"
 
       - name: Scarica il modello da Hugging Face
         run: |

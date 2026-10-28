@@ -103,7 +103,7 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   **la stessa copia**, quindi guardare il PDF e poi scaricarlo costa **una sola** anonimizzazione
   (il download passa da `/doc/<id>/file.pdf`). `/pdf` resta invariato per chi usa l'API.
 - **Preferenze di anonimizzazione** → `prefs.json` nella config dir (`EXCLUDED_TAGS`,
-  `MAPPING_ENABLED`). File **separato da `config.json`** perché Tauri riscrive quest'ultimo per
+  `MAPPING_ENABLED`, `OCR_ENABLED`). File **separato da `config.json`** perché Tauri riscrive quest'ultimo per
   intero quando si cambia porta dallo splash. Precedenza: campo nella richiesta > CLI > env > file.
 - **Tag disattivabili**: i tag deselezionati vengono rilevati ma **non** sostituiti (restano in
   chiaro) — serve a confrontare gli importi o a tenere età/sesso in un caso clinico. Env
@@ -141,8 +141,24 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   `X-PII-Residual` e `X-PII-Skipped`): (a) *residui* = valore ancora leggibile nell'output alla
   verifica finale; (b) *saltati* = valori con < 2 caratteri alfanumerici o di 2 sole cifre (es. "45"),
   non cercabili senza devastare il documento. Se in tutto il PDF non si trova **nessuna** occorrenza
-  → `422`, non un PDF "anonimizzato" che non lo è (caso tipico: scansione, serve OCR → punti 2-4
-  della issue). Nessuna dipendenza dal modello: `pdf_export.py` è testabile in isolamento.
+  → `422`, non un PDF "anonimizzato" che non lo è (caso tipico: scansione → serve l'OCR, vedi
+  `ocr.py` sotto). Nessuna dipendenza dal modello: `pdf_export.py` è testabile in isolamento.
+- `ocr.py` — **OCR integrato per i PDF scansionati** (pagina senza layer testuale: la PII è
+  dentro un'immagine, quindi la redazione vettoriale non può agire). `app._extract_document_text`
+  riconosce la situazione **pagina per pagina** (`ocr.scanned_pages`: < 20 caratteri di testo E
+  qualcosa disegnato) e, se serve, rasterizza la pagina a 200 DPI e la passa al motore.
+  Motori in plug-in, il primo disponibile vince: **Tesseract** (binario di sistema, qualità migliore,
+  box **per parola** → la redazione copre la parola esatta) e **RapidOCR/ONNX**
+  (`pip install rapidocr-onnxruntime`, nessun binario, l'unico impacchettabile nel Tauri/PyInstaller,
+  box **per riga** → la redazione copre tutta la riga). Nessuna dipendenza obbligatoria: senza
+  motore l'app funziona come prima e l'errore (`code: ocr_unavailable`) dice cosa installare.
+  Il testo riconosciuto entra nell'analisi come qualsiasi altro testo; il PDF viene redatto in
+  **burn-in** (`pdf_export.redact_pdf_ocr`): la pagina è rasterizzata e le caselle sono annerite
+  **DENTRO i pixel** (i pixel originali non restano nel file, quindi la PII non è recuperabile) e il
+  placeholder viene scritto sopra.
+  Switch "OCR automatico" nella UI, `ocr_enabled` in `prefs.json`,
+  env `PII_OCR=0`, CLI `--no-ocr`. Il risultato dell'OCR è **cachato in memoria** per hash del file
+  (`_OCR_CACHE`): /preview, /analyze e /pdf/preview non riconoscono due volte lo stesso file.
 - `serve.py` — entry **headless** (solo Flask, niente browser): è il backend dell'app Tauri; log su
   `%LOCALAPPDATA%\rizzo-pii\backend.log`. Pre-check porta + `sys.exit(76)` se occupata.
   `desktop_app.py` — entry PyInstaller legacy (apre il browser); stesso pre-check.

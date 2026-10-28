@@ -29,5 +29,12 @@ python-dotenv
 flask
 pymupdf
 
+# OCR (optional) -- only needed to anonymize SCANNED PDFs (no text layer).
+# Without one of these the app works exactly as before and says that a scan
+# needs an engine. Install ONE of the two:
+#   pip install rapidocr-onnxruntime   # pure pip, no system binary, bundleable
+#   (or install Tesseract as a system package: tesseract-ocr + tesseract-ocr-ita)
+# rapidocr-onnxruntime
+
 # Loss / metric plots produced by the training script
 matplotlib

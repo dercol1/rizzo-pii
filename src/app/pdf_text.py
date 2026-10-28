@@ -15,16 +15,17 @@ Nei PDF fillable (AcroForm) il valore sta nel widget, non nel content stream:
 REDACT_ANNOT = 12
 
 
-def collect_readable_text(doc, redact_annot_type=REDACT_ANNOT):
-    """TUTTO il testo leggibile: pagine + annotazioni + campi modulo + segnalibri.
+def collect_extras(doc, redact_annot_type=REDACT_ANNOT):
+    """Solo le parti che NON stanno nel content stream delle pagine:
+    annotazioni + campi modulo + segnalibri.
 
-    `doc` e' un iterabile di pagine con `get_text()`, `annots()`, `widgets()`
-    e (sul documento) `get_toc(simple=True)`: il contratto di PyMuPDF, senza
-    importarlo. NB: non vede il testo dentro immagini raster.
+    Serve all'OCR: quando una pagina e' una scansione, il suo testo viene
+    riconosciuto dall'OCR, ma le annotazioni e i campi modulo esistono
+    ancora e vanno tenuti (il testo del documento e' "layer testuale + OCR",
+    non "solo OCR").
     """
     parts = []
     for page in doc:
-        parts.append(page.get_text() or "")
         try:
             for a in page.annots() or ():
                 if a.type[0] == redact_annot_type:
@@ -44,4 +45,18 @@ def collect_readable_text(doc, redact_annot_type=REDACT_ANNOT):
         parts.extend(str(e[1] or "") for e in (doc.get_toc(simple=True) or ()))
     except Exception:
         pass
-    return "\n".join(parts)
+    return "\n".join(p for p in parts if p)
+
+
+def collect_readable_text(doc, redact_annot_type=REDACT_ANNOT):
+    """TUTTO il testo leggibile: pagine + annotazioni + campi modulo + segnalibri.
+
+    `doc` e' un iterabile di pagine con `get_text()`, `annots()`, `widgets()`
+    e (sul documento) `get_toc(simple=True)`: il contratto di PyMuPDF, senza
+    importarlo. NB: non vede il testo dentro immagini raster.
+    """
+    parts = []
+    for page in doc:
+        parts.append(page.get_text() or "")
+    parts.append(collect_extras(doc, redact_annot_type=redact_annot_type))
+    return "\n".join(p for p in parts if p)

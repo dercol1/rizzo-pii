@@ -31,10 +31,19 @@ Endpoint HTTP:
                   il PDF anonimizzato resta in memoria e si guarda pagina per pagina
   GET  /doc/<id>/page/<n>.png   pagina renderizzata (anteprima a video)
   GET  /doc/<id>/file.pdf       download del documento tenuto in memoria
-  GET  /settings  legenda dei 23 tag, tag esclusi, stato del dizionario reversibile
-  POST /settings  {"excluded_tags": [...], "mapping_enabled": bool} -> salva in prefs.json
+  GET  /settings  legenda dei 23 tag, tag esclusi, stato del dizionario reversibile,
+                  stato dell'OCR (motore installato, switch automatico)
+  POST /settings  {"excluded_tags": [...], "mapping_enabled": bool, "ocr_enabled": bool}
                   (/tags e' un alias storico degli stessi due endpoint)
   GET  /config, POST /config, GET /port-check   host/porta del server
+
+OCR: quando il PDF caricato NON ha layer testuale (una scansione), l'app lo
+riconosce da sola e passa la pagina al motore OCR (Tesseract o RapidOCR/ONNX,
+vedi src/app/ocr.py): il testo riconosciuto entra nell'analisi come qualsiasi
+altro testo, e il PDF viene redatto in "burn-in" (le caselle vengono annerite
+DENTRO i pixel, cosi' la PII non resta recuperabile nel file). Lo switch "OCR
+automatico" lo disattiva; senza alcun motore installato l'app funziona come
+prima e dice cosa installare.
 
 Avvio:  python app.py   ->   http://127.0.0.1:5005
 Configurazione host/porta (precedenza): CLI --host/--port > env PII_HOST/PII_PORT >
@@ -44,6 +53,7 @@ Preferenze di anonimizzazione (precedenza): campo nella richiesta > CLI --exclud
 """
 
 import bisect
+import hashlib
 import os
 import re
 import secrets
@@ -57,6 +67,7 @@ import torch
 from flask import (Flask, jsonify, render_template_string, request,
                    send_from_directory)
 
+import ocr
 import pdf_export
 import pdf_text
 import server_config
@@ -131,13 +142,39 @@ OVERLAP = 20         # parole di sovrapposizione tra chunk consecutivi
 # --------------------------------------------------------------------------- #
 device = 0 if torch.cuda.is_available() else -1
 print(f"Carico il modello da {MODEL_DIR} su {'GPU' if device == 0 else 'CPU'}...")
-nlp = pipeline(
-    "token-classification",
-    model=MODEL_DIR,
-    tokenizer=MODEL_DIR,
-    aggregation_strategy="simple",
-    device=device,
-)
+try:
+    nlp = pipeline(
+        "token-classification",
+        model=MODEL_DIR,
+        tokenizer=MODEL_DIR,
+        aggregation_strategy="simple",
+        device=device,
+    )
+except Exception as e:
+    # La cartella del modello puo' ESISTERE ed essere incompleta: e' quello che resta
+    # quando il download viene interrotto, oppure quando i symlink del cache HF (che
+    # puntano a ../../blobs/) restano appesi perche' la cartella blobs/ e' stata
+    # cancellata. transformers, in quel caso, non dice "manca config.json" ma
+    # "Unrecognized model ... Should have a `model_type` key in its config.json": un
+    # messaggio che sembra accusare il FORMATO del modello e invece segnala un file
+    # che non c'e'. Qui si distingue la cartella incompleta dall'errore vero e proprio.
+    _v = APP_MODEL_VERSION or "1.5.0"
+    if not os.path.isfile(os.path.join(MODEL_DIR, "config.json")):
+        print(f"ERRORE: modello incompleto in {MODEL_DIR}: config.json manca o non e' "
+              f"leggibile (download interrotto, oppure symlink rimasti appesi: i "
+              f"symlink del cache HF puntano a ../../blobs/, se blobs/ e' sparito il "
+              f"modello non c'e' piu').\n"
+              f"Riscaria il modello per intero:\n"
+              f"  rm -rf {MODEL_DIR}\n"
+              f"  hf download rizzoaiacademy/rizzo-pii-0.3B --revision v{_v} "
+              f"--local-dir models/rizzo-pii-0.3B-v{_v}\n"
+              f"Oppure indica una cartella tua con la variabile PII_MODEL_DIR.",
+              file=sys.stderr)
+    else:
+        print(f"ERRORE: caricamento del modello fallito da {MODEL_DIR}: {e}\n"
+              f"Verifica che la cartella contenga config.json, tokenizer.json e "
+              f"model.safetensors.", file=sys.stderr)
+    sys.exit(2)
 print("Modello pronto.")
 
 app = Flask(__name__)
@@ -264,6 +301,7 @@ TAG_NAMES = [t[0] for t in TAGS]
 _prefs = server_config.load_prefs()
 EXCLUDED_TAGS = _prefs["excluded_tags"]
 MAPPING_ENABLED = _prefs["mapping_enabled"]
+OCR_ENABLED = _prefs.get("ocr_enabled", True)   # OCR automatico sulle scansioni
 _PREFS_LOCK = threading.Lock()   # protegge la lettura/scrittura ATOMICA della coppia sopra
 
 
@@ -271,6 +309,12 @@ def _get_prefs():
     """Snapshot coerente di (excluded_tags, mapping_enabled): mai una POST /settings a meta'."""
     with _PREFS_LOCK:
         return EXCLUDED_TAGS, MAPPING_ENABLED
+
+
+def _get_ocr_enabled():
+    """Stato dello switch "OCR automatico" (con lo stesso lock delle altre preferenze)."""
+    with _PREFS_LOCK:
+        return OCR_ENABLED
 
 
 # --------------------------------------------------------------------------- #
@@ -507,12 +551,126 @@ def health():
         "tags": len(TAG_NAMES),
         "excluded_tags": excl,
         "mapping_enabled": mapping,
+        "ocr_enabled": _get_ocr_enabled(),
+        "ocr": ocr.engine_status(),
     }
     return jsonify(body), (200 if ready else 503)
 
 
 def _is_pdf(name, data):
     return os.path.splitext((name or "").lower())[1] == ".pdf" or data[:5] == b"%PDF-"
+
+
+class OcrFailed(ValueError):
+    """L'OCR e' servito ma non e' stato possibile farlo.
+
+    ValueError perche' le rotte gia' lo trattano come "file non leggibile"
+    (400 con messaggio); `code` dice al client il motivo preciso, cosi' l'UI
+    puo' distinguere "motore non installato" da "OCR disattivato" da "errore".
+    """
+
+    def __init__(self, msg, code="ocr_failed"):
+        super().__init__(msg)
+        self.code = code
+
+
+# Cache degli OCR: /preview, /analyze e /pdf/preview ricevono lo STESSO file e
+# l'OCR e' la parte piu' lenta di tutta la pipeline. La cache e' in memoria (mai
+# su disco, come i documenti dell'anteprima) e tiene poche voci: la chiave e'
+# l'hash dei byte del PDF, quindi lo stesso file non viene riconosciuto due volte.
+_OCR_CACHE = OrderedDict()
+_OCR_CACHE_MAX = 3
+_OCR_CACHE_LOCK = threading.Lock()
+
+
+def _ocr_cache_get(key):
+    with _OCR_CACHE_LOCK:
+        hit = _OCR_CACHE.get(key)
+        if hit is not None:
+            _OCR_CACHE.move_to_end(key)
+    return hit
+
+
+def _ocr_cache_put(key, value):
+    with _OCR_CACHE_LOCK:
+        _OCR_CACHE[key] = value
+        _OCR_CACHE.move_to_end(key)
+        while len(_OCR_CACHE) > _OCR_CACHE_MAX:
+            _OCR_CACHE.popitem(last=False)
+
+
+def _extract_document_text(name, data):
+    """Testo del documento caricato + i metadati dell'OCR.
+
+    Ritorna (text, meta):
+      text -> il testo da analizzare (layer testuale, con le pagine scansionate
+              sostituite dal testo riconosciuto dall'OCR);
+      meta -> {"ocr": {...}} se l'OCR e' stato usato, {} altrimenti. La chiave
+              interna "_ocr_result" contiene il risultato grezzo dell'OCR (con i
+              box delle parole), serve alla redazione "burn-in" e NON viene
+              mandata al client.
+
+    Per i PDF non c'e' niente da cambiare: se il documento ha il layer testuale
+    si comporta esattamente come prima. L'OCR scatta solo se una pagina non ha
+    testo utilizzabile (una scansione).
+    """
+    if not _is_pdf(name, data):
+        return _text_from_bytes(name, data), {}
+
+    key = hashlib.sha256(data).hexdigest()
+    hit = _ocr_cache_get(key)
+    if hit is not None:
+        return hit["text"], hit["meta"]
+
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        if doc.needs_pass:
+            raise PdfLocked("PDF protetto da password: rimuovi la protezione e riprova.")
+        scans = ocr.scanned_pages(doc)
+        if not scans:
+            # nessuna scansione: il layer testuale basta (comportamento di sempre)
+            text = pdf_text.collect_readable_text(doc)
+            meta = {}
+        else:
+            pages = ocr.page_texts(doc)
+            extras = pdf_text.collect_extras(doc)
+
+    if scans:
+        if not _get_ocr_enabled():
+            raise OcrFailed(
+                "Questo PDF e' una scansione (il testo e' dentro un'immagine) e "
+                "l'OCR automatico e' disattivato: riattivalo nelle impostazioni "
+                "oppure incolla il testo a mano.",
+                code="ocr_disabled")
+        try:
+            res = ocr.ocr_pdf(data, pages=scans)
+        except ocr.OcrUnavailable as e:
+            raise OcrFailed(str(e), code="ocr_unavailable") from e
+        except ocr.OcrError as e:
+            raise OcrFailed(f"OCR fallito: {e}", code="ocr_failed") from e
+        for p in res["pages"]:
+            pages[p["page"]] = p["text"]
+        text = "\n".join(pages)
+        if extras:
+            text = text + "\n" + extras
+        meta = {
+            "ocr": {
+                "engine": res["engine"],
+                "dpi": res["dpi"],
+                "lang": res["lang"],
+                "pages": len(res["pages"]),
+                "page_numbers": [p["page"] + 1 for p in res["pages"]],
+                "seconds": res["seconds"],
+                "chars": len(res["text"]),
+            },
+            "_ocr_result": res,
+        }
+    _ocr_cache_put(key, {"text": text, "meta": meta})
+    return text, meta
+
+
+def _public_meta(meta):
+    """Meta senza le chiavi interne (quelle che iniziano con "_")."""
+    return {k: v for k, v in (meta or {}).items() if not k.startswith("_")}
 
 
 def _text_from_bytes(name, data):
@@ -578,9 +736,12 @@ def _uploaded_file():
 @app.route("/analyze", methods=["POST"])
 def analyze_route():
     up = _uploaded_file()
+    meta = {}
     if up is not None:
         try:
-            text = _extract_upload(up)
+            text, meta = _extract_document_text(up.filename, up.read())
+        except OcrFailed as e:
+            return jsonify({"error": str(e), "code": e.code}), 400
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:                       # PDF corrotto / protetto
@@ -610,6 +771,8 @@ def analyze_route():
     # valore in chiaro: la chiave manca del tutto, come il valore nei segmenti (#118).
     if keep_map:
         out["source_text"] = text
+    # com'e' andata l'estrazione: se il documento era una scansione, l'UI lo dice
+    out.update(_public_meta(meta))
     return jsonify(out)
 
 
@@ -657,10 +820,13 @@ def _build_anonymized_pdf():
     Ritorna (bytes, report, n_redazioni, nome_file). Solleva _ReqError sugli errori.
     """
     up = _uploaded_file()
+    meta = {}
     if up is not None:
         name, data = up.filename, up.read()
         try:
-            text = _text_from_bytes(name, data)
+            text, meta = _extract_document_text(name, data)
+        except OcrFailed as e:
+            raise _ReqError(str(e), 400)
         except ValueError as e:
             raise _ReqError(str(e))
         except Exception as e:                       # PDF corrotto / protetto
@@ -687,14 +853,20 @@ def _build_anonymized_pdf():
                         "anonimizzare in questo documento.", 422)
 
     if data and _is_pdf(name, data):
+        ocr_res = meta.get("_ocr_result")
         try:
-            out, report = pdf_export.redact_pdf(data, res["mapping"])
+            if ocr_res:
+                # Scansione: la PII e' nei pixel, non nel content stream. La pagina
+                # viene rasterizzata e le caselle annerite DENTRO i pixel (burn-in).
+                out, report = pdf_export.redact_pdf_ocr(data, res["mapping"], ocr_res)
+            else:
+                out, report = pdf_export.redact_pdf(data, res["mapping"])
         except pdf_export.PdfError as e:
             raise _ReqError(str(e))
         if report["occurrences"] == 0:
-            raise _ReqError("Nessuna occorrenza trovata nel PDF: se il documento "
-                            "e' una scansione (testo dentro un'immagine) la "
-                            "redazione del layer testuale non puo' agire.", 422)
+            raise _ReqError("Nessuna occorrenza trovata nel PDF: il testo "
+                            "riconosciuto dall'OCR non contiene nessuna PII "
+                            "rilevata (prova a rivedere la scansione).", 422)
         return out, report, report["occurrences"], out_name
 
     try:
@@ -729,7 +901,7 @@ def pdf_preview_route():
     except _ReqError as e:
         return jsonify({"error": e.msg}), e.status
     doc_id, n_pages = _store_doc(out, name)
-    return jsonify({
+    body = {
         "doc_id": doc_id,
         "n_pages": n_pages,
         "filename": name,
@@ -737,7 +909,12 @@ def pdf_preview_route():
         "residual": len(report.get("residual", [])),
         "skipped": len(report.get("skipped", [])),
         "not_found": len(report.get("not_found", [])),
-    })
+    }
+    # le pagine redatte in burn-in (scansioni): l'UI avvisa che il PDF e' stato
+    # rasterizzato e che quelle pagine non hanno piu' testo selezionabile
+    if report.get("ocr_pages"):
+        body["ocr_pages"] = report["ocr_pages"]
+    return jsonify(body)
 
 
 # --------------------------------------------------------------------------- #
@@ -824,9 +1001,11 @@ def pii_zones_route():
         return jsonify({"error": "L'estrazione zone PII vale solo per i PDF."}), 400
     
     try:
-        text = _text_from_bytes(name, data)
+        text, _meta = _extract_document_text(name, data)
     except PdfLocked as e:
         return jsonify({"error": f"Impossibile leggere il file: {e}", "code": "pdf_locked"}), 400
+    except OcrFailed as e:
+        return jsonify({"error": str(e), "code": e.code}), 400
     except Exception as e:
         return jsonify({"error": f"Impossibile leggere il file: {e}"}), 400
     
@@ -983,9 +1162,11 @@ def analyze_with_zones_route():
         return jsonify({"error": "L'analisi con zone vale solo per i PDF."}), 400
     
     try:
-        text = _text_from_bytes(name, data)
+        text, _meta = _extract_document_text(name, data)
     except PdfLocked as e:
         return jsonify({"error": f"Impossibile leggere il file: {e}", "code": "pdf_locked"}), 400
+    except OcrFailed as e:
+        return jsonify({"error": str(e), "code": e.code}), 400
     except Exception as e:
         return jsonify({"error": f"Impossibile leggere il file: {e}"}), 400
     
@@ -1025,14 +1206,18 @@ def preview_route():
     if not _is_pdf(name, data):
         return jsonify({"error": "L'anteprima renderizzata vale solo per i PDF."}), 400
     try:
-        text = _text_from_bytes(name, data)
+        text, meta = _extract_document_text(name, data)
         doc_id, n_pages = _store_doc(data, name)
     except PdfLocked as e:
         return jsonify({"error": f"Impossibile leggere il file: {e}", "code": "pdf_locked"}), 400
+    except OcrFailed as e:
+        return jsonify({"error": str(e), "code": e.code}), 400
     except Exception as e:                           # PDF corrotto / protetto
         return jsonify({"error": f"Impossibile leggere il file: {e}"}), 400
-    return jsonify({"doc_id": doc_id, "n_pages": n_pages,
-                    "filename": _safe_name(name), "text": text})
+    body = {"doc_id": doc_id, "n_pages": n_pages,
+            "filename": _safe_name(name), "text": text}
+    body.update(_public_meta(meta))
+    return jsonify(body)
 
 
 @app.route("/doc/<doc_id>/page/<int:n>.png")
@@ -1074,15 +1259,19 @@ def settings_get():
         "tags": [{"tag": t, "it": it, "en": en, "example": ex} for t, it, en, ex in TAGS],
         "excluded_tags": excl,
         "mapping_enabled": mapping,
+        "ocr_enabled": _get_ocr_enabled(),
+        "ocr": ocr.engine_status(),
         "config_path": str(server_config.prefs_path()),
-        "env_override": "PII_EXCLUDE_TAGS" in os.environ or "PII_MAPPING" in os.environ,
+        "env_override": ("PII_EXCLUDE_TAGS" in os.environ
+                         or "PII_MAPPING" in os.environ
+                         or "PII_OCR" in os.environ),
     })
 
 
 @app.route("/settings", methods=["POST"])
 @app.route("/tags", methods=["POST"])
 def settings_post():
-    global EXCLUDED_TAGS, MAPPING_ENABLED
+    global EXCLUDED_TAGS, MAPPING_ENABLED, OCR_ENABLED
     data = request.get_json(silent=True) or {}
     tags = None
     if "excluded_tags" in data:
@@ -1091,14 +1280,20 @@ def settings_post():
         if unknown:
             return jsonify({"error": f"Tag sconosciuti: {', '.join(unknown)}"}), 400
     mapping = data.get("mapping_enabled")
-    if tags is None and mapping is None:
-        return jsonify({"error": "Niente da salvare: passa excluded_tags e/o mapping_enabled."}), 400
-    saved = server_config.save_prefs(excluded_tags=tags, mapping_enabled=mapping)
+    ocr_enabled = data.get("ocr_enabled")
+    if tags is None and mapping is None and ocr_enabled is None:
+        return jsonify({"error": "Niente da salvare: passa excluded_tags, "
+                                 "mapping_enabled e/o ocr_enabled."}), 400
+    saved = server_config.save_prefs(excluded_tags=tags, mapping_enabled=mapping,
+                                     ocr_enabled=ocr_enabled)
     with _PREFS_LOCK:
         EXCLUDED_TAGS = saved["excluded_tags"]
         MAPPING_ENABLED = saved["mapping_enabled"]
+        OCR_ENABLED = saved.get("ocr_enabled", True)
     return jsonify({"ok": True, "excluded_tags": EXCLUDED_TAGS,
-                    "mapping_enabled": MAPPING_ENABLED})
+                    "mapping_enabled": MAPPING_ENABLED,
+                    "ocr_enabled": OCR_ENABLED,
+                    "ocr": ocr.engine_status()})
 
 
 # --------------------------------------------------------------------------- #
@@ -1421,6 +1616,11 @@ PAGE = r"""
   .mapsw.off .st{background:#ffedd5;color:#9a3412}
   .mapsw .sub{font-size:12.5px;color:var(--muted);line-height:1.45;margin-top:2px}
   .mapsw.off .sub{color:#7a4d12}
+  /* stato dell'OCR: lo stesso blocco dello switch, ma con il motore a destra */
+  .ocrsw .eng{font-size:11px;font-weight:800;letter-spacing:.04em;border-radius:999px;
+              padding:2px 8px;background:#eef2ff;color:#3730a3;margin-left:auto}
+  .ocrsw.none .eng{background:#fee2e2;color:#991b1b}
+  .ocrsw.off .eng{background:#f1e9f7;color:var(--brand-dk)}
 
   /* modale "Tag da anonimizzare": legenda dei 23 tag con toggle per tipo */
   .cfg-card.wide{width:600px}
@@ -1503,6 +1703,16 @@ PAGE = r"""
               <div class="ttl" id="mapTtl"><span data-i18n="map_ttl">Dizionario reversibile</span>
                 <span class="st" id="mapState">ATTIVO</span></div>
               <div class="sub" id="mapSub">Ogni PII riceve un ID: potrai ripristinare i valori veri dalla risposta dell'LLM.</div>
+            </div>
+          </div>
+          <div class="mapsw ocrsw" id="ocrSw">
+            <button class="tsw" id="ocrToggle" role="switch" aria-checked="true"
+                    aria-labelledby="ocrTtl" onclick="toggleOcr()"><span class="knob"></span></button>
+            <div>
+              <div class="ttl" id="ocrTtl"><span data-i18n="ocr_ttl">OCR automatico</span>
+                <span class="st" id="ocrState">ATTIVO</span>
+                <span class="eng" id="ocrEngine">—</span></div>
+              <div class="sub" id="ocrSub">Riconosce il testo dei PDF scansionati.</div>
             </div>
           </div>
           <div class="row">
@@ -1667,6 +1877,8 @@ let TAGS = [];             // legenda dei tag servita da /settings
 let EXCL = new Set();      // tag da NON anonimizzare (scelta corrente)
 let TAGS_LOADED = false;   // /settings ha risposto -> possiamo mandare gli override
 let MAPPING = true;        // dizionario reversibile on/off (switch nella card di input)
+let OCR = true;            // OCR automatico sulle scansioni on/off
+let OCR_INFO = null;       // {available, engine, detail} da /settings
 let SRC_DOC = null;        // PDF caricato, renderizzato dal server (colonna sinistra)
 let OUT_DOC = null;        // PDF anonimizzato (colonna destra), generato pigramente
 let VIEW = 'prev';         // vista attiva a destra: prev | text | pdf
@@ -1737,6 +1949,15 @@ const T = {
   dict_off:"Nessun dizionario: l'anonimizzazione di questo testo è <b>definitiva</b>.",
   dict_off_hint:"lo switch è su DISATTIVO",
   r_off:"Lo switch <b>Dizionario reversibile</b> è su DISATTIVO: le nuove anonimizzazioni non producono chiavi. Qui puoi comunque ripristinare con un dizionario <b>.json salvato in precedenza</b>.",
+  ocr_ttl:"OCR automatico", ocr_on:"ATTIVO", ocr_off:"DISATTIVO",
+  ocr_sub_on:"Riconosce il testo dei PDF scansionati (quelli senza layer testuale) e lo rende anonimizzabile.",
+  ocr_sub_off:"L'OCR è disattivato: sui PDF scansionati l'app non trova testo e lo segnala.",
+  ocr_none:"nessun motore installato",
+  ocr_engine_t:"Tesseract", ocr_engine_o:"ONNX",
+  t_ocr_on:"OCR automatico attivo", t_ocr_off:"OCR automatico disattivato",
+  ocr_badge:(e,p,s)=>"OCR · "+e+" · "+p+" pagine · "+s+" s",
+  ocr_burnin:"Le pagine scansionate sono state rasterizzate per coprire le PII: in quelle pagine il testo non è più selezionabile.",
+  t_ocr_missing:"Serve l'OCR ma nessun motore è installato. Installa Tesseract oppure rapidocr-onnxruntime.",
  },
  en:{
   tagline:"local model on CPU · GDPR compliant", badge:"100% local",
@@ -1802,6 +2023,15 @@ const T = {
   dict_off:"No dictionary: anonymization of this text is <b>irreversible</b>.",
   dict_off_hint:"the switch is OFF",
   r_off:"The <b>Reversible dictionary</b> switch is OFF: new anonymizations produce no keys. You can still restore here using a <b>.json dictionary saved earlier</b>.",
+  ocr_ttl:"Automatic OCR", ocr_on:"ON", ocr_off:"OFF",
+  ocr_sub_on:"Recognizes the text of scanned PDFs (the ones with no text layer) and makes them anonymizable.",
+  ocr_sub_off:"OCR is off: on scanned PDFs the app finds no text and says so.",
+  ocr_none:"no engine installed",
+  ocr_engine_t:"Tesseract", ocr_engine_o:"ONNX",
+  t_ocr_on:"Automatic OCR on", t_ocr_off:"Automatic OCR off",
+  ocr_badge:(e,p,s)=>"OCR · "+e+" · "+p+" pages · "+s+" s",
+  ocr_burnin:"Scanned pages were rasterized to cover the PII: in those pages the text is no longer selectable.",
+  t_ocr_missing:"OCR is needed but no engine is installed. Install Tesseract or rapidocr-onnxruntime.",
  }
 };
 const tt=k=>T[L][k];
@@ -1821,6 +2051,7 @@ function applyLang(l){
   if(!$('pdf').files.length) $('dropTxt').innerHTML=tt('drop');   // dropzone: solo se nessun file
   if(!$('rout')._raw) $('rout').innerHTML=routEmpty();
   renderMapping();
+  renderOcr();
   if(TAGS.length && $('tagsOverlay').classList.contains('open')) renderTags();
   if(DATA) render();
 }
@@ -1928,7 +2159,12 @@ async function onFile(f){
     if(!r.ok)throw new Error(d.error||'');
     SRC_DOC=d;$('src').value=d.text||'';
     renderPages($('pdfSrcView'),d);
-    $('inHint').style.display='none';
+    if(d.ocr){                       // il PDF era una scansione: l'OCR ha fatto il suo lavoro
+      const badge='🔍 '+T[L].ocr_badge(d.ocr.engine==='tesseract'?tt('ocr_engine_t'):tt('ocr_engine_o'),
+                                       d.ocr.pages,d.ocr.seconds);
+      $('inHint').style.display='';$('inHint').textContent=badge;
+      toast(badge,true,4000);
+    } else $('inHint').style.display='none';
   }catch(e){
     SRC_DOC=null;$('srcTabs').style.display='none';setSrcView('text');
     $('inHint').innerHTML=tt('in_hint');$('inHint').style.display='';
@@ -1953,7 +2189,9 @@ async function run(){
       resp=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify(body)});}
     const d=await resp.json();
-    if(!resp.ok){toast(d.error||tt('t_error'),false);return;}
+    if(!resp.ok){
+      const long=(d.code==='ocr_unavailable'||d.code==='ocr_disabled');
+      toast(d.error||tt('t_error'),false,long?9000:1800);return;}
     if(d.source_text&&file)$('src').value=d.source_text;
     DATA=d;off.clear();
     // senza dizionario non tocchiamo MAP ne' il localStorage: nessuna chiave nuova nasce
@@ -1992,7 +2230,10 @@ function render(){
     `<span class="stat"><b>${(d.by_source.regex||0)}</b> ${tt('st_regex')}</span>`+
     `<span class="stat"><b>${T[L].chars(d.n_chars)}</b> ${tt('st_chars')}</span>`+
     ((d.excluded_tags&&d.excluded_tags.length)
-      ? `<span class="stat" title="${d.excluded_tags.join(', ')}"><b>${d.excluded_tags.length}</b> ${tt('st_excl')}</span>` : '');
+      ? `<span class="stat" title="${d.excluded_tags.join(', ')}"><b>${d.excluded_tags.length}</b> ${tt('st_excl')}</span>` : '')+
+    (d.ocr?`<span class="stat" title="${d.ocr.engine||''}">🔍 ${T[L].ocr_badge(
+        d.ocr.engine==='tesseract'?tt('ocr_engine_t'):tt('ocr_engine_o'),
+        d.ocr.pages,d.ocr.seconds)}</span>`:'');
   // legenda cliccabile (toggle highlight)
   const lg=$('legend');lg.innerHTML='';
   for(const [k,v] of Object.entries(d.by_label)){
@@ -2067,8 +2308,10 @@ function buildOutPdf(){
           resp=await fetch('/pdf/preview',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify(body)});}
       const d=await resp.json();
-      if(!resp.ok){toast(d.error||tt('t_pdf_err'),false);return null;}
-      OUT_DOC=d;return d;
+      if(!resp.ok){toast(d.error||tt('t_pdf_err'),false,9000);return null;}
+      OUT_DOC=d;
+      if(d.ocr_pages&&d.ocr_pages.length)toast(tt('ocr_burnin'),false,7000);
+      return d;
     }catch(e){toast(tt('t_pdf_err')+': '+e.message,false);return null;}
     finally{PDF_JOB=null;}
   })();
@@ -2264,6 +2507,35 @@ async function toggleMapping(){
   }catch(e){}
 }
 
+/* ---- switch "OCR automatico" (PDF scansionati) ---- */
+function renderOcr(){
+  const on=OCR;
+  $('ocrToggle').classList.toggle('off',!on);
+  $('ocrToggle').setAttribute('aria-checked',String(on));
+  $('ocrSw').classList.toggle('off',!on);
+  $('ocrState').textContent=on?tt('ocr_on'):tt('ocr_off');
+  $('ocrSub').innerHTML=on?tt('ocr_sub_on'):tt('ocr_sub_off');
+  const info=OCR_INFO||{};
+  const eng=$('ocrEngine');
+  if(!OCR_INFO){eng.textContent='—';$('ocrSw').classList.remove('none');}
+  else if(info.available){
+    eng.textContent=info.engine==='tesseract'?tt('ocr_engine_t'):tt('ocr_engine_o');
+    $('ocrSw').classList.remove('none');
+  }else{
+    eng.textContent=tt('ocr_none');
+    $('ocrSw').classList.add('none');
+  }
+}
+async function toggleOcr(){
+  OCR=!OCR;
+  renderOcr();
+  toast(OCR?tt('t_ocr_on'):tt('t_ocr_off'),OCR);
+  try{                                 // persiste: vale anche per l'API
+    await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ocr_enabled:OCR})});
+  }catch(e){}
+}
+
 /* ---- tags modal: legenda + selezione dei tag da anonimizzare ---- */
 let TAGS_META={};
 async function loadTags(){
@@ -2271,6 +2543,7 @@ async function loadTags(){
     const d=await (await fetch('/settings')).json();
     TAGS=d.tags||[];EXCL=new Set(d.excluded_tags||[]);TAGS_META=d;TAGS_LOADED=true;
     MAPPING=d.mapping_enabled!==false;renderMapping();
+    OCR=d.ocr_enabled!==false;OCR_INFO=d.ocr||null;renderOcr();
   }catch(e){/* server vecchio o offline: si continua con il comportamento di default */}
 }
 function renderTags(){
@@ -2337,6 +2610,8 @@ if __name__ == "__main__":
                     help="tag PII da NON anonimizzare, es. AGE,GENDER (default da env/prefs.json)")
     _p.add_argument("--no-mapping", action="store_true",
                     help="anonimizzazione definitiva: non costruire il dizionario di ripristino")
+    _p.add_argument("--no-ocr", action="store_true",
+                    help="non usare l'OCR sui PDF scansionati (nessun layer testuale)")
     _args = _p.parse_args()
 
     if _args.exclude_tags is not None:
@@ -2348,11 +2623,18 @@ if __name__ == "__main__":
             sys.exit(2)
     if _args.no_mapping:
         MAPPING_ENABLED = False
+    if _args.no_ocr:
+        OCR_ENABLED = False
     if EXCLUDED_TAGS:
         print(f"Tag esclusi dall'anonimizzazione: {', '.join(EXCLUDED_TAGS)}")
     print("Dizionario reversibile: " +
           ("ATTIVO (si puo' ripristinare)" if MAPPING_ENABLED
            else "DISATTIVO (anonimizzazione definitiva)"))
+    _ocr_status = ocr.engine_status()
+    print("OCR sulle scansioni: " +
+          ("ATTIVO" if OCR_ENABLED else "DISATTIVO") +
+          f" · motore: {_ocr_status['engine'] or 'nessuno'}"
+          + (f" ({_ocr_status['detail']})" if _ocr_status["available"] else ""))
 
     _host, _port = server_config.resolve(cli_host=_args.host, cli_port=_args.port)
 

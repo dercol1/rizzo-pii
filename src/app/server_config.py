@@ -18,7 +18,7 @@ dall'app Tauri per mostrare il form di configurazione nello splash.
 
 Nella stessa directory vivono anche le preferenze di anonimizzazione, prefs.json:
 
-  {"excluded_tags": ["AGE", "GENDER"], "mapping_enabled": true}
+  {"excluded_tags": ["AGE", "GENDER"], "mapping_enabled": true, "ocr_enabled": true}
 
 E' un file separato di proposito: Tauri riscrive config.json per intero quando si
 cambia la porta dallo splash, e sovrascriverebbe qualunque altra chiave.
@@ -82,6 +82,7 @@ def save_config(host: str, port: int):
 PREFS_FILE = "prefs.json"
 LEGACY_PREFS_FILE = "tags.json"   # nome usato prima che il file contenesse anche il mapping
 DEFAULT_MAPPING_ENABLED = True
+DEFAULT_OCR_ENABLED = True
 
 
 def prefs_path() -> Path:
@@ -134,30 +135,37 @@ def _read_prefs_file() -> dict:
 def load_prefs() -> dict:
     """Preferenze effettive. Catena: env > prefs.json > default.
 
-    env: PII_EXCLUDE_TAGS="AGE,GENDER"   PII_MAPPING=0|1
+    env: PII_EXCLUDE_TAGS="AGE,GENDER"   PII_MAPPING=0|1   PII_OCR=0|1
     """
     data = _read_prefs_file()
     tags = data.get("excluded_tags")
     mapping = data.get("mapping_enabled", DEFAULT_MAPPING_ENABLED)
+    ocr = data.get("ocr_enabled", DEFAULT_OCR_ENABLED)
     if "PII_EXCLUDE_TAGS" in os.environ:
         tags = os.environ["PII_EXCLUDE_TAGS"]
     if "PII_MAPPING" in os.environ:
         mapping = os.environ["PII_MAPPING"]
+    if "PII_OCR" in os.environ:
+        ocr = os.environ["PII_OCR"]
     return {
         "excluded_tags": parse_tag_list(tags),
         "mapping_enabled": parse_bool(mapping, DEFAULT_MAPPING_ENABLED),
+        "ocr_enabled": parse_bool(ocr, DEFAULT_OCR_ENABLED),
     }
 
 
-def save_prefs(excluded_tags=None, mapping_enabled=None) -> dict:
+def save_prefs(excluded_tags=None, mapping_enabled=None, ocr_enabled=None) -> dict:
     """Scrive prefs.json unendo le chiavi passate a quelle gia' sul file (i None non toccano nulla)."""
     data = _read_prefs_file()
     if excluded_tags is not None:
         data["excluded_tags"] = parse_tag_list(excluded_tags)
     if mapping_enabled is not None:
         data["mapping_enabled"] = parse_bool(mapping_enabled, DEFAULT_MAPPING_ENABLED)
+    if ocr_enabled is not None:
+        data["ocr_enabled"] = parse_bool(ocr_enabled, DEFAULT_OCR_ENABLED)
     data.setdefault("excluded_tags", [])
     data.setdefault("mapping_enabled", DEFAULT_MAPPING_ENABLED)
+    data.setdefault("ocr_enabled", DEFAULT_OCR_ENABLED)
     d = config_dir()
     d.mkdir(parents=True, exist_ok=True)
     (d / PREFS_FILE).write_text(json.dumps(data, indent=2), "utf-8")
