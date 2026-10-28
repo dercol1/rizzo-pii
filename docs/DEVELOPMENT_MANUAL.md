@@ -103,7 +103,7 @@ Il cuore della generazione sintetica: **l'LLM scrive solo la prosa con segnapost
 ```
 rizzo-pii/
 ├─ README.md                    # Documentazione utente completa
-├─ DEVELOPMENT_MANUAL.md        # Questo file
+
 ├─ CLAUDE.md                    # Istruzioni operative + vincoli ambiente
 ├─ CONTRIBUTING.md              # Come contribuire (codice, docs, dati)
 ├─ LICENSE                      # MIT
@@ -123,7 +123,8 @@ rizzo-pii/
 │   ├─ FORMATO_DATI.md          # Formato esatto row dataset (JSONL/BIO)
 │   ├─ BUILD.md                 # Build desktop (Tauri + PyInstaller legacy)
 │   ├─ CHANGELOG.md             # Change log con rationale
-│   └─ star_history_*.png       # Grafici stelle (rigenerabili)
+│   ├─ star_history_*.png       # Grafici stelle (rigenerabili)
+|   └─ DEVELOPMENT_MANUAL.md    # Questo file
 ├─ scripts/
 │   └─ plot_star_history.py     # Rigenera grafici stelle
 ├─ src/
