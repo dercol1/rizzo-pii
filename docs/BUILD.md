@@ -171,6 +171,8 @@ docker run --rm -e VENV=/opt/venv -e APPIMAGE_EXTRACT_AND_RUN=1 \
 ### Avvio da sorgente (senza build, per sviluppo/test rapido)
 
 Non serve compilare: l'app gira direttamente da sorgente Python.
+Le stesse istruzioni in inglese sono in
+**[README.md → Run the web app from source](../README.md#run-the-web-app-from-source)**.
 
 ```bash
 git clone https://github.com/Rizzo-AI-Academy/rizzo-pii

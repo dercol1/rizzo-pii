@@ -314,6 +314,43 @@ models/registry.json  # storico versioni
 | `serve.py` | **Headless** (solo Flask, niente browser) — backend dell'app Tauri |
 | `desktop_app.py` | Legacy PyInstaller (apre browser) |
 
+### Avvio da Sorgente (Sviluppo Rapido)
+
+Senza build, senza PyInstaller: si avvia direttamente il backend Flask dalle sorgenti Python.
+
+```bash
+git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
+cd rizzo-pii
+
+# 1. Venv + dipendenze (CPU torch va benissimo)
+python3 -m venv .venv && source .venv/bin/activate   # Windows: py -3.11 -m venv .venv
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# 2. Modello (~1.2 GB): revision e cartella devono matchare APP_MODEL_VERSION
+hf download rizzoaiacademy/rizzo-pii-0.3B --revision v1.5.0 \
+  --local-dir models/rizzo-pii-0.3B-v1.5.0
+
+# 3. Avvio
+python src/app/app.py      # UI nel browser -> http://127.0.0.1:5005
+python src/app/serve.py    # headless (backend Tauri), niente browser
+```
+
+Verifica di readiness (200 = modello caricato, 503 = ancora in caricamento):
+
+```bash
+curl http://127.0.0.1:5005/health
+```
+
+Knobs: `--port`, `--exclude-tags TAG,TAG`, `--no-mapping`, env `PII_MODEL_DIR` (cartella modello
+alternativa), `PII_EXCLUDE_TAGS`, `PII_MAPPING=0`, `PII_HOST`/`PII_PORT`.
+
+> Su Debian/Ubuntu recenti il Python di sistema è *externally managed*: `pip install` globale
+> viene rifiutato, per questo serve il venv.
+
+Versione in inglese delle stesse istruzioni:
+**[README.md → Run the web app from source](../README.md#run-the-web-app-from-source)**.
+
 ### Configurazione Host/Porta (Precedenza)
 
 1. CLI `--host`/`--port`

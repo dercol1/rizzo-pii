@@ -358,22 +358,78 @@ docker run -d -p 127.0.0.1:8080:8080 -e PII_PORT=8080 \
 
 ### Run the web app from source
 
-Same server, without Docker — this is what the desktop app runs internally.
+Same server, without Docker — this is what the desktop app runs internally. **No compilation, no
+PyInstaller, no Rust toolchain**: the Flask backend runs straight from the Python sources, so it is
+the fastest way to iterate on the model, the API or the UI.
+
+#### 1) Environment and dependencies
 
 ```bash
 git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
 cd rizzo-pii
-python -m venv .venv && source .venv/bin/activate     # Windows: .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt                       # CPU torch is fine, no GPU needed
 
-# the model (~1.2 GB) into the folder the app looks for. The folder name carries the
-# version: app.py pins it in APP_MODEL_VERSION, so revision and directory must match.
+python3 -m venv .venv                    # Windows: py -3.11 -m venv .venv
+source .venv/bin/activate                 # Windows: .\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt # CPU torch is fine, no GPU needed
+```
+
+> Use a virtual environment: on recent Debian/Ubuntu the system Python is *externally managed*
+> (`externally-managed-environment`), so a global `pip install` is refused.
+
+#### 2) Download the model (~1.2 GB)
+
+```bash
 hf download rizzoaiacademy/rizzo-pii-0.3B --revision v1.5.0 \
   --local-dir models/rizzo-pii-0.3B-v1.5.0
-
-python src/app/app.py                                 # -> http://127.0.0.1:5005
-python src/app/app.py --port 8080 --exclude-tags AGE,GENDER --no-mapping   # same knobs as above
 ```
+
+The revision **and** the directory name must match `APP_MODEL_VERSION` in `src/app/app.py`
+(`1.5.0` → `models/rizzo-pii-0.3B-v1.5.0`); a mismatch is the most common startup failure.
+
+#### 3) Start the app
+
+```bash
+python src/app/app.py                    # -> http://127.0.0.1:5005
+```
+
+Open **http://127.0.0.1:5005** in your browser. Stop it with `Ctrl+C`.
+
+#### 4) Check that it is ready
+
+```bash
+curl http://127.0.0.1:5005/health
+```
+
+A response with `"status": "ok"` and `"model_loaded": true` means the model is loaded and the
+service is ready. While the model loads, `/health` answers `503`.
+
+#### Options
+
+```bash
+python src/app/app.py --port 8080                  # listen on another port
+python src/app/app.py --exclude-tags AGE,GENDER     # leave some tags in the clear
+python src/app/app.py --no-mapping                 # irreversible: no restore dictionary
+
+PII_MODEL_DIR=/path/to/model python src/app/app.py  # use a model in another folder
+```
+
+Precedence for the anonymization preferences is **request field > CLI flag > environment
+(`PII_EXCLUDE_TAGS`, `PII_MAPPING`) > `prefs.json` > default**; for host/port it is
+**CLI > environment (`PII_HOST`, `PII_PORT`) > `config.json` > `127.0.0.1:5005`**.
+
+#### Headless mode (backend of the Tauri app)
+
+```bash
+python src/app/serve.py                 # same server, no browser is opened
+```
+
+This is the mode the Tauri desktop app talks to; it is also handy behind a reverse proxy.
+
+> Running from source is enough for everything the app offers: text and PDF anonymization,
+> previews, the reversible dictionary, and the `/pii-zones`, `/analyze-with-zones` and
+> `/ocr-zones` endpoints.
 
 ### One document, from the CLI
 
