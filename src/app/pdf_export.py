@@ -587,6 +587,11 @@ def _ocr_page_hits(ocr_page, usable, by_ph, hits, next_id, pno, w, h):
             if placed:
                 hits.append({"id": next_id, "page": pno, "placeholder": ph,
                              "kind": "burnin", "rects": placed,
+                             # intervallo di testo coperto: serve al layer di
+                             # testo per sapere QUALI parole non riscrivere
+                             # (geometricamente non basta: un box puo' essere
+                             # piu' grande della parola)
+                             "span": [m.start(), m.end()],
                              "w": round(w, 2), "h": round(h, 2)})
                 by_ph[ph] += 1
                 next_id += 1
@@ -616,9 +621,16 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
     Le pagine con OCR vengono rasterizzate e annerite; le altre (layer testuale)
     vengono redatte come sempre, in vettore. Il risultato e' un PDF misto.
 
-    ATTENZIONE (perdita di qualita' deliberata): la pagina rasterizzata non ha
-    piu' il testo selezionabile. E' il prezzo della privacy: i pixel originali
-    della scansione non restano nel file.
+    Il testo riconosciuto viene RIScritto in un layer INVISIBILE (render_mode
+    3): la pagina resta identica a come si vede, ma il testo torna
+    selezionabile, con le etichette al posto dei valori censurati. Le parole
+    coperte NON vengono riscritte: al loro posto c'e' il placeholder (gia'
+    visibile), cosi' il testo copiato non contiene due volte la stessa PII.
+
+    ATTENZIONE (perdita di qualita' deliberata): la pagina rasterizzata e'
+    un'immagine, quindi la qualita' del testo e' quella dello scan e non
+    vettoriale. E' il prezzo della privacy: i pixel originali della scansione
+    non restano nel file.
     """
     items, skipped, usable, by_ph, patterns = _prepare_items(mapping)
     exclude = set(exclude or ())
@@ -675,14 +687,26 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
 
             np_ = out_doc.new_page(width=page.rect.width, height=page.rect.height)
             np_.insert_image(np_.rect, pixmap=pix2)
+            # i rettangoli EFFETTIVAMENTE coperti (le occorrenze annullate
+            # restano in chiaro: il loro testo torna nel layer invisibile)
+            covered = []
+            placeholders = []
+            spans = []
             for h in hits:
                 if h["page"] != i or h["id"] in exclude:
                     continue
                 for r in h["rects"]:
                     rect = fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"])
+                    covered.append(rect)
                     fs = _fit_fontsize(h["placeholder"], rect)
                     if fs:
-                        _insert_placeholder(np_, rect, h["placeholder"], fs, text_color)
+                        placeholders.append((rect, h["placeholder"], fs))
+                if h.get("span"):
+                    spans.append(tuple(h["span"]))
+            # layer di testo: le parole non coperte diventano selezionabili
+            # (invisibili), le coperte restano il placeholder visibile
+            words, _coarse = _page_words(op)
+            _write_page_text(np_, words, covered, spans, placeholders, text_color)
             total += sum(1 for h in hits if h["page"] == i and h["id"] not in exclude)
     finally:
         src.close()
@@ -735,6 +759,150 @@ def _insert_placeholder(page, rect, ph, fontsize, color):
         page.insert_text((x, y), ph, fontname="helv", fontsize=fontsize, color=color)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Layer di testo invisibile sulle pagine rasterizzate
+#
+# Il burn-in rasterizza la pagina: il testo riconosciuto vive nei pixel e
+# non si puo' piu' selezionare. Qui si scrive un layer di testo INVISIBILE
+# (render_mode 3) con le stesse coordinate delle parole riconosciute: il
+# lettore PDF puo' cosi' selezionare e copiare il testo della scansione.
+#
+# Le parole coperte NON vengono scritte: al loro posto c'e' gia' il placeholder
+# (il testo vero e' scritto sopra la casella, in chiaro e selezionabile), e
+# cosi' il testo copiato e' il testo del documento con le etichette al posto
+# delle PII.
+# --------------------------------------------------------------------------- #
+def _covered_by(rect, others):
+    """Il rettangolo e' dentro (per buona parte) uno di questi?"""
+    area = rect.get_area()
+    if area <= 0:
+        return False
+    for r in others:
+        inter = fitz.Rect(rect)
+        inter.intersect(r)
+        if not inter.is_empty and inter.get_area() / area >= 0.5:
+            return True
+    return False
+
+
+def _ocr_fontsize(text, rect):
+    """Corpo del testo che fa stare `text` nel rettangolo riconosciuto.
+
+    L'altezza della casella OCR e' l'altezza dei caratteri maiuscoli: il corpo
+    reale e' un po' piu' grande (si usa il rapporto tipografico 0.72). Poi la
+    larghezza della casella stringe il corpo, se il testo e' piu' largo."""
+    h = rect.height
+    if h <= 0:
+        return 0
+    fs = min(24.0, h / 0.72)
+    try:
+        w = fitz.get_text_length(text, fontname="helv", fontsize=fs)
+    except Exception:
+        return 0
+    if w > 0 and rect.width > 0:
+        fs = min(fs, fs * (rect.width / w))
+    return round(max(fs, 3.0), 1)
+
+
+def _write_invisible(page, rect, txt, fontsize):
+    """Scrive una parola in modo INVISIBILE (render_mode 3).
+
+    Il lettore PDF la vede come testo selezionabile, ma non la stampa a
+    schermo: il file resta identico a prima, il testo torna selezionabile.
+    """
+    # helv copre il Latin-1: i caratteri fuori sono sostituiti
+    safe = txt.encode("latin-1", "replace").decode("latin-1")
+    base = rect.y1 - 0.12 * rect.height      # baseline poco sopra il fondo
+    try:
+        page.insert_text((rect.x0, base), safe, fontname="helv",
+                         fontsize=fontsize, render_mode=3)
+    except Exception:
+        pass
+
+
+def _reading_order(items):
+    """Ordina gli elementi di testo come si leggono: riga per riga, da sinistra.
+
+    Le parole riconosciute non hanno lo stesso `y0` (la casella OCR e' alta
+    quanto i caratteri maiuscoli, quindi varia da parola a parola): se si
+    ordinassero solo per `y0` le parole della stessa riga finirebbero
+    separate. Qui le parole sono raggruppate per riga (sovrapposizione
+    verticale) e ordinate per colonna.
+    """
+    if not items:
+        return []
+    # ordine grezzo per y (per costruire le righe in modo stabile)
+    items = sorted(items, key=lambda it: (it[0], it[1]))
+    righe = []            # [(y0, y1, [items])]
+    for it in items:
+        y0, y1 = it[3].y0, it[3].y1
+        tol = max(1.0, (y1 - y0) * 0.5)
+        for r in righe:
+            if y0 < r[1] + tol and y1 > r[0] - tol:
+                r[0] = min(r[0], y0)
+                r[1] = max(r[1], y1)
+                r[2].append(it)
+                break
+        else:
+            righe.append([y0, y1, [it]])
+    righe.sort(key=lambda r: r[0])
+    out = []
+    for _y0, _y1, its in righe:
+        its.sort(key=lambda it: (it[1], it[2]))
+        out.extend(its)
+    return out
+
+
+def _write_page_text(page, words, covered, spans, placeholders, text_color):
+    """Scrive TUTTO il testo della pagina rasterizzata, in ordine di lettura.
+
+    - le parole NON coperte: layer invisibile (render_mode 3) -> il testo
+      della scansione resta selezionabile;
+    - i placeholder delle parole coperte: testo VISIBILE sopra la casella.
+
+    Il testo coperto e' escluso in due modi, per sicurezza:
+      - per GEOMETRIA (la parola e' dentro una casella coperta);
+      - per TESTO (la parola interseca l'intervallo del valore coperto:
+        se il box OCR e' piu' grande della parola, la geometria da sola
+        non basterebbe a escluderla).
+
+    L'ordine e' quello delle coordinate (riga, colonna): il testo copiato dal
+    lettore si legge come il documento originale, con le etichette al posto
+    delle PII.
+    """
+    items = []
+    for w in words or []:
+        txt = (w.get("text") or "").strip()
+        if not txt:
+            continue
+        rect = fitz.Rect(w.get("x0", 0), w.get("y0", 0),
+                         w.get("x1", 0), w.get("y1", 0))
+        if rect.is_empty or rect.width <= 0:
+            continue
+        if _covered_by(rect, covered):
+            continue          # al suo posto c'e' gia' il placeholder
+        ws, we = w.get("start"), w.get("end")
+        if ws is not None and we is not None:
+            for s0, s1 in spans or ():
+                if ws < s1 and we > s0:      # la parola tocca il valore coperto
+                    break
+            else:
+                fs = _ocr_fontsize(txt, rect)
+                if fs:
+                    items.append((rect.y0, rect.x0, 0, rect, txt, fs))
+                continue
+        fs = _ocr_fontsize(txt, rect)
+        if fs:
+            items.append((rect.y0, rect.x0, 0, rect, txt, fs))
+    for rect, ph, fs in placeholders or []:
+        items.append((rect.y0, rect.x0, 1, rect, ph, fs))
+    for _y, _x, kind, rect, txt, fs in _reading_order(items):
+        if kind:
+            _insert_placeholder(page, rect, txt, fs, text_color)
+        else:
+            _write_invisible(page, rect, txt, fs)
 
 
 def _add_redact_annot(page, rect, text, fontsize, fill, text_color):

@@ -969,6 +969,33 @@ file** (se le caselle fossero solo disegnate sopra, la PII sarebbe recuperabile 
 content stream). Il placeholder è scritto come testo vettore sopra la casella, quindi
 resta selezionabile e cercabile.
 
+### Layer di testo invisibile (il testo resta selezionabile)
+
+Il burn-in rasterizza la pagina: il testo riconosciuto vive nei pixel e non si può più
+selezionare. Per non perdere il testo, `pdf_export._write_page_text` lo **riscrive** in
+un layer **invisibile** (`render_mode=3`) con le stesse coordinate delle parole:
+
+```
+parole OCR (non coperte)  → insert_text(render_mode=3)  → invisibile ma selezionabile
+parole coperte           → placeholder (testo vettore VISIBILE sulla casella)
+```
+
+Due dettagli:
+
+- **le parole coperte non vengono riscritte**: al loro posto c'è già il placeholder
+  (visibile e selezionabile), altrimenti il testo copiato avrebbe la PII *e* l'etichetta.
+  L'esclusione è doppia: per **geometria** (la parola è dentro una casella coperta) e per
+  **testo** (la parola interseca l'intervallo `span` del valore coperto — il box OCR può
+  essere più grande della parola, la geometria da sola non basterebbe);
+- **l'ordine è quello di lettura** (`_reading_order`): le parole sono raggruppate per riga
+  (sovrapposizione verticale) e ordinate per colonna, così il testo copiato si legge come
+  il documento originale.
+
+Il rendering **non cambia**: il layer è invisibile, la pagina stampata è identica a prima
+(verificato a byte sul pixmap). Il guadagno è che il testo torna selezionabile e che il
+controllo dei residui (`_verify_residuals`, che legge il testo dell'output) diventa finally
+utile anche sulle pagine rasterizzate: prima non poteva vedere niente.
+
 ### Configurazione
 
 | Livello | Come |
@@ -990,7 +1017,9 @@ riconoscono due volte le stesse pagine. Mai su disco.
 
 - l'OCR gira **in processo** e blocca la richiesta: ~3-5 s/pagina con RapidOCR, ~1-2 s
   con Tesseract; tetto di `OCR_MAX_PAGES` (40) pagine per documento;
-- la pagina rasterizzata **non ha più testo selezionabile** (solo i placeholder);
+- la pagina rasterizzata è un'immagine: il testo è ricostruito in un layer invisibile,
+  quindi è selezionabile ma **non** è più un testo vettoriale (la qualità è quella dello
+  scan, non quella del font originale);
 - con i motori per riga la posizione delle parole è una **stima** (la casella può essere
   un po' più larga della parola): over-redazione, ma la PII è certamente coperta.
 
@@ -1019,7 +1048,8 @@ lo vede, da qui `uncovered`).
 
 - `tests/test_ocr_scansione.py` — riconoscimento della scansione, coordinate, burn-in
   (verifica **del pixel**: sotto la PII non deve più esserci bianco), casella **per
-  parola** (non tutta la riga), coperture annullabili;
+  parola** (non tutta la riga), coperture annullabili, **layer di testo invisibile**
+  (il testo non censurato è selezionabile, quello censurato no, il rendering non cambia);
 - `tests/test_ocr_app.py` — `/analyze` e `/pdf` su un PDF scansionato, errori
   `ocr_unavailable` / `ocr_disabled`, `/health` e `/settings`, `POST /doc/<id>/redactions`
   (annullare e ripristinare una copertura).

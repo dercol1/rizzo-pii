@@ -5,6 +5,37 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-28 — Il testo delle scansioni resta selezionabile (layer invisibile)
+
+Il burn-in rasterizza la pagina per poter annerire le PII **dentro i pixel** (i pixel
+originali non devono restare nel file: altrimenti la PII sarebbe recuperabile). Il prezzo
+era che la pagina diventava un'immagine: **il testo non si poteva più selezionare**, e il
+controllo dei residui (`_verify_residuals`, che legge il testo dell'output) non poteva
+vedere niente sulle pagine rasterizzate.
+
+Ora, dopo il burn-in, il testo riconosciuto viene **riscritto in un layer invisibile**
+(`render_mode=3`) nelle stesse coordinate delle parole (`pdf_export._write_page_text`):
+
+- il rendering **non cambia** (verificato a byte sul pixmap: il layer è invisibile);
+- il testo si **seleziona e si cerca** come in un PDF normale, con le etichette al posto
+  dei valori censurati;
+- le parole **coperte non vengono riscritte**: al loro posto c'è già il placeholder
+  (visibile e selezionabile), altrimenti il testo copiato avrebbe la PII *e* l'etichetta.
+  L'esclusione è doppia: per geometria (la parola è dentro una casella coperta) e per
+  **intervallo di testo** (la parola interseca lo `span` del valore coperto: il box OCR
+  può essere più grande della parola, la geometria da sola non basterebbe);
+- l'ordine di scrittura è quello di **lettura** (`_reading_order`: righe per sovrapposizione
+  verticale, colonne da sinistra a destra), così il testo copiato si legge come l'originale;
+- con il layer il controllo dei residui diventa finally utile anche sulle scansioni: i
+  valori lasciati in chiaro (per esempio le coperture annullate dall'anteprima) vengono
+  **rilevati** e segnalati all'utente.
+
+Test: `tests/test_ocr_scansione.py` (classe `LayerDiTestoInvisibile`: il testo non censurato
+è selezionabile, quello censurato no, l'etichetta c'è una volta sola, il rendering non
+cambia, il testo annullato torna in chiaro).
+
+---
+
 ## 2026-10-28 — OCR integrato: caselle per parola e coperture annullabili dall'anteprima
 
 Due problemi risolti insieme, entrambi sulla riga "scansioni" (documenti senza layer

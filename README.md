@@ -607,7 +607,12 @@ and runs an OCR engine for you:
   is not recoverable from the file. The placeholder is written on top of the box;
 - the boxes cover the **word(s) of the PII**, not the whole line: Tesseract gives the
   coordinates of every word, and for the line-based engines the words are estimated
-  from the width of the line.
+  from the width of the line;
+- the recognised text is **written back as an invisible text layer** (`render_mode 3`)
+  in the anonymized PDF: the page looks exactly the same, but the text is **selectable
+  and searchable** again, with the labels in place of the redacted values. The redacted
+  words are *not* rewritten (their label already stands there), so copying the text
+  never gives you the PII twice.
 
 > Nothing leaves the machine: the OCR runs locally, like everything else.
 
@@ -688,8 +693,9 @@ restores the redaction.
 - the OCR runs in-process and **blocks** the request: a 40-page scan takes a while
   (≈3–5 s/page with RapidOCR, ≈1–2 s/page with Tesseract). The cap is 40 pages
   per document (`OCR_MAX_PAGES`);
-- the burn-in **rasterizes** the page: in a redacted scan the text is no longer
-  selectable (the placeholders are);
+- the burn-in **rasterizes** the page: the text is rebuilt as an invisible layer, so it
+  stays selectable, but it is no longer vector text (the quality is the scan's, not the
+  original font's);
 - an OCR error is an OCR error: a misread digit in an IBAN means a wrong placeholder.
   Check the result, as always.
 

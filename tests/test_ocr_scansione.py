@@ -187,6 +187,76 @@ class RedazioneBurnIn(unittest.TestCase):
             pdf_export.redact_pdf_ocr(pdf_scansionato(), {}, {"pages": []})
 
 
+class LayerDiTestoInvisibile(unittest.TestCase):
+    """Il testo della scansione deve restare SELEZIONABILE nel PDF scaricato.
+
+    Il burn-in rasterizza la pagina (la PII deve sparire dai pixel), ma il
+    testo riconosciuto viene riscritto in un layer INVISIBILE (render_mode 3):
+    il lettore PDF lo mostra come selezionabile, con le etichette al posto
+    dei valori censurati. Il rendering, invece, non deve cambiare.
+    """
+
+    def _redige(self, mapping=None, exclude=None):
+        pdf = pdf_scansionato()
+        res = ocr.ocr_pdf(pdf, pages=[0], dpi=200, engine=FakeParoleEngine())
+        out, report = pdf_export.redact_pdf_ocr(
+            pdf, mapping or {"[FULLNAME_1]": "Mario Rossi"}, res, dpi=200,
+            exclude=exclude)
+        return out, report
+
+    def _testo(self, out):
+        with fitz.open(stream=out, filetype="pdf") as doc:
+            return "".join(p.get_text() for p in doc)
+
+    def test_il_testo_non_censurato_e_selezionabile(self):
+        out, _report = self._redige()
+        testo = self._testo(out)
+        self.assertIn("nato a Milano", testo)
+
+    def test_il_valore_censurato_non_e_nel_testo(self):
+        out, _report = self._redige()
+        testo = self._testo(out)
+        self.assertNotIn("Mario Rossi", testo)
+        self.assertNotIn("Rossi", testo)
+
+    def test_l_etichetta_e_nel_testo_al_posto_del_valore(self):
+        out, _report = self._redige()
+        self.assertIn("[FULLNAME_1]", self._testo(out))
+
+    def test_le_parole_censurate_non_sono_nel_layer_invisibile(self):
+        """La parola coperta non deve tornare come testo invisibile: il
+        placeholder e' gia' li' al suo posto."""
+        out, _report = self._redige()
+        testo = self._testo(out)
+        self.assertEqual(testo.count("[FULLNAME_1]"), 1)
+
+    def test_il_rendering_non_cambia(self):
+        """Il layer e' invisibile: la pagina stampata e' IDENTICA a prima."""
+        pdf = pdf_scansionato()
+        res = ocr.ocr_pdf(pdf, pages=[0], dpi=200, engine=FakeParoleEngine())
+        mapping = {"[FULLNAME_1]": "Mario Rossi"}
+        out, _ = pdf_export.redact_pdf_ocr(pdf, mapping, res, dpi=200)
+        # rifaccio senza il layer invisibile
+        orig = pdf_export._write_invisible
+        pdf_export._write_invisible = lambda *a, **k: None
+        try:
+            out_senza, _ = pdf_export.redact_pdf_ocr(pdf, mapping, res, dpi=200)
+        finally:
+            pdf_export._write_invisible = orig
+
+        def pixel(b):
+            with fitz.open(stream=b, filetype="pdf") as doc:
+                return bytes(doc.load_page(0).get_pixmap(dpi=120).samples)
+
+        self.assertEqual(pixel(out), pixel(out_senza))
+
+    def test_il_testo_annullato_torna_in_chiaro(self):
+        """Annullando la copertura la PII torna nel testo (e nei pixel)."""
+        out, report = self._redige(exclude={0})
+        self.assertEqual(report["uncovered"], ["[FULLNAME_1]"])
+        self.assertIn("Rossi", self._testo(out))
+
+
 class MotoreNonInstallato(unittest.TestCase):
     def test_lo_stato_del_motore_e_una_cosa_sola(self):
         st = ocr.engine_status()

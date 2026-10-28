@@ -157,6 +157,12 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   **burn-in** (`pdf_export.redact_pdf_ocr`): la pagina è rasterizzata e le caselle sono annerite
   **DENTRO i pixel** (i pixel originali non restano nel file, quindi la PII non è recuperabile) e il
   placeholder viene scritto sopra.
+  **Il testo resta selezionabile**: dopo il burn-in il testo riconosciuto viene riscritto in un
+  layer **invisibile** (`render_mode=3`, `pdf_export._write_page_text`), nelle stesse coordinate:
+  la pagina stampata è identica, ma il testo si può selezionare e cercare, con le etichette al
+  posto dei valori censurati. Le parole coperte **non** vengono riscritte (esclusione per
+  geometria E per intervallo di testo: `span`), altrimenti il testo copiato avrebbe la PII due
+  volte; l'ordine di scrittura è quello di lettura (`_reading_order`).
   Switch "OCR automatico" nella UI, `ocr_enabled` in `prefs.json`,
   env `PII_OCR=0`, CLI `--no-ocr`. Il risultato dell'OCR è **cachato in memoria** per hash del file
   (`_OCR_CACHE`): /preview, /analyze e /pdf/preview non riconoscono due volte lo stesso file.
