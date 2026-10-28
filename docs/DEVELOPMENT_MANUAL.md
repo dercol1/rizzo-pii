@@ -452,9 +452,10 @@ Serve per: confrontare importi (`AMOUNT`), tenere età/sesso in caso clinico (`A
 | `/analyze` | POST | `{"text":...}` o multipart file | JSON | Entità + testo anonimizzato + dizionario |
 | `/pdf` | POST | Come `/analyze` | **PDF binario** | Download PDF anonimizzato (redazione vera se input PDF) |
 | `/preview` | POST | Multipart `.pdf` | JSON | Carica PDF per anteprima sx → `{doc_id, n_pages, text}` |
-| `/pdf/preview` | POST | Come `/pdf` | JSON | Anonimizza + store in memoria → `{doc_id, n_pages, ...}` |
+| `/pdf/preview` | POST | Come `/pdf` | JSON | Anonimizza + store in memoria → `{doc_id, n_pages, hits, excluded, ...}` |
 | `/doc/<id>/page/<n>.png` | GET | — | PNG | Pagina n (0-based) del documento in memoria |
 | `/doc/<id>/file.pdf` | GET | — | PDF | Download documento anonimizzato in memoria |
+| `/doc/<id>/redactions` | POST | `{"excluded":[id,...]}` | JSON | Annulla/ripristina coperture → rigenera il PDF (`hits`, `excluded`, `residual`) |
 | `/settings` | GET | — | JSON | Legenda tag, tag esclusi, stato dizionario |
 | `/settings` | POST | `{"excluded_tags":[...], "mapping_enabled":bool}` | JSON | Salva preferenze in `prefs.json` |
 | `/config` | GET | — | JSON | Host/porta correnti + path config |
@@ -941,12 +942,18 @@ riconoscere.
 | Motore | Installazione | Granularità del box | Note |
 |---|---|---|---|
 | `tesseract` | binario di sistema (`tesseract-ocr` + `tesseract-ocr-ita`) | **parola** | qualità migliore; l'output TSV dà le coordinate di ogni parola |
-| `onnx` | `pip install rapidocr-onnxruntime` | **riga** | nessun binario, unico impacchettabile in Tauri/PyInstaller |
+| `onnx` | `pip install rapidocr-onnxruntime` | **riga** (le parole vengono stimate dalla larghezza della riga) | nessun binario, unico impacchettabile in Tauri/PyInstaller |
 
-Il contratto di un motore (`ocr._Engine.recognize(png) -> [righe]`) è una riga = testo +
-rettangolo in **pixel**; `ocr.py` converte i pixel in punti PDF (`72/dpi`) e tiene gli
-**offset del testo** di ogni riga, così il matching delle PII sulla pagina OCR usa gli
+Il contratto di un motore (`ocr._Engine.recognize(png) -> [blocchi]`) è un blocco = riga
+riconosciuta: testo + rettangolo in **pixel** + (se il motore sa darle) le **parole** con
+il loro box. `ocr.py` converte i pixel in punti PDF (`72/dpi`) e tiene gli **offset del
+testo** di ogni riga e di ogni parola, così il matching delle PII sulla pagina OCR usa gli
 stessi pattern char-precisi del layer testuale (`pdf_export._value_pattern`).
+
+**La casella copre la PII, non la riga**: `pdf_export._ocr_rects` unisce i box delle
+**parole** che cadono nell'intervallo di testo della PII. Con Tesseract i box sono quelli
+veri del TSV; con i motori per riga le parole sono stimate (`ocr._split_words_in_rect`:
+larghezza della riga distribuita in proporzione alla larghezza reale dei glifi).
 
 **Redazione delle scansioni** (`pdf_export.redact_pdf_ocr`): la pagina non può essere
 redatta in vettore, quindi viene **rasterizzata** e le caselle vengono annerite **dentro
@@ -984,15 +991,38 @@ riconoscono due volte le stesse pagine. Mai su disco.
 - l'OCR gira **in processo** e blocca la richiesta: ~3-5 s/pagina con RapidOCR, ~1-2 s
   con Tesseract; tetto di `OCR_MAX_PAGES` (40) pagine per documento;
 - la pagina rasterizzata **non ha più testo selezionabile** (solo i placeholder);
-- con il motore ONNX la casella copre **tutta la riga** riconosciuta (con Tesseract la
-  parola esatta): over-redazione, ma la PII è certamente coperta.
+- con i motori per riga la posizione delle parole è una **stima** (la casella può essere
+  un po' più larga della parola): over-redazione, ma la PII è certamente coperta.
+
+### Coperture annullabili (anteprima interattiva)
+
+Ogni copertura ha un **id** e una geometria: il report di `redact_pdf` / `redact_pdf_ocr`
+restituisce `hits` (id, pagina, placeholder, rettangoli) e `uncovered` (i placeholder
+rimasti in chiaro per annullamento). La geometria dipende **solo** dal documento e dal
+dizionario: annullare una copertura non sposta le altre.
+
+Flusso (`app.py`):
+
+```
+POST /pdf/preview            -> _store_doc(out, plan)  [plan = originale + dizionario + OCR]
+POST /doc/<id>/redactions     -> rigenera il PDF con exclude={id annullati}
+   {"excluded": [0, 3]}         -> aggiorna d["pdf"], svuota la cache delle pagine, "v"++
+```
+
+La UI (`renderPages` + `toggleHit`) disegna le caselle come overlay cliccabili sopra la
+pagina renderizzata e chiama l'endpoint al click. Le caselle annullate restano visibili
+con il bordo tratteggiato (per poterle ripristinare) e il documento viene segnalato con
+`residual` (nel burn-in il valore sta nei **pixel**: il controllo dei residui sul testo non
+lo vede, da qui `uncovered`).
 
 ### Test
 
 - `tests/test_ocr_scansione.py` — riconoscimento della scansione, coordinate, burn-in
-  (verifica **del pixel**: sotto la PII non deve più esserci bianco);
+  (verifica **del pixel**: sotto la PII non deve più esserci bianco), casella **per
+  parola** (non tutta la riga), coperture annullabili;
 - `tests/test_ocr_app.py` — `/analyze` e `/pdf` su un PDF scansionato, errori
-  `ocr_unavailable` / `ocr_disabled`, `/health` e `/settings`.
+  `ocr_unavailable` / `ocr_disabled`, `/health` e `/settings`, `POST /doc/<id>/redactions`
+  (annullare e ripristinare una copertura).
 
 ---
 

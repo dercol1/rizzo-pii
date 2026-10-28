@@ -386,12 +386,18 @@ def _prepare_items(mapping):
     return items, skipped, usable, by_ph, patterns
 
 
-def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
+def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT,
+               exclude=None):
     """PDF originale -> PDF con redazione vera + placeholder al posto delle PII.
 
     mapping: {"[FULLNAME_1]": "Mario Rossi", ...} (il dizionario di analyze()).
+    `exclude`: insieme di id di occorrenze da NON redigere (l'utente ha
+    annullato la copertura dall'anteprima: vedi /doc/<id>/redactions). Le
+    occorrenze escluse restano in chiaro e finiscono in `report["residual"]`.
+
     Ritorna (bytes, report) con report = {
         "occurrences":    occorrenze redatte nel testo di pagina,
+        "found":          occorrenze trovate (comprese quelle annullate),
         "by_placeholder": {placeholder: n_occorrenze},
         "not_found":      placeholder cercati ma senza occorrenze di pagina,
         "skipped":        placeholder NON cercati perche' troppo corti/ambigui
@@ -401,9 +407,15 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
         "widgets":        sostituzioni nei campi modulo,
         "toc":            sostituzioni nei segnalibri,
         "embedded":       allegati rimossi,
+        "hits":           le occorrenze con la loro geometria (per l'anteprima
+                          interattiva: un click annulla la copertura),
+        "uncovered":      placeholder rimasti in chiaro perche' l'utente ha
+                          annullato la copertura (nel burn-in i pixel non sono
+                          verificabili dal testo: qui sono le uniche prove),
     }
     """
     items, skipped, usable, by_ph, patterns = _prepare_items(mapping)
+    exclude = set(exclude or ())
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -414,9 +426,16 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
         raise PdfError("PDF protetto da password: rimuovi la protezione e riprova.")
 
     total = n_annots = n_widgets = 0
+    hits = []
+    next_id = 0
 
-    for page in doc:
-        total += _redact_page_vector(page, usable, by_ph, fill, text_color)
+    # 1) la geometria delle occorrenze (dipende SOLO dal documento e dal
+    #    dizionario: annullare una copertura non sposta le altre)
+    for pno, page in enumerate(doc):
+        next_id = _page_hits_vector(page, usable, by_ph, hits, next_id, pno)
+    # 2) la copertura vera (saltando le occorrenze annullate)
+    for pno, page in enumerate(doc):
+        total += _apply_hits_vector(page, hits, pno, exclude, fill, text_color)
         # dopo le redazioni: annotazioni e campi modulo non sono content stream
         n_annots += _scrub_annots(page, patterns)
         n_widgets += _scrub_widgets(page, patterns)
@@ -430,6 +449,7 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
     checked = [(ph, v) for ph, v in items if ph in by_ph]
     return out, {
         "occurrences": total,
+        "found": len(hits),
         "by_placeholder": by_ph,
         "not_found": [ph for ph, n in by_ph.items() if n == 0],
         "skipped": skipped,
@@ -438,39 +458,62 @@ def redact_pdf(pdf_bytes, mapping, fill=REDACT_FILL, text_color=REDACT_TEXT):
         "widgets": n_widgets,
         "toc": n_toc,
         "embedded": n_emb,
+        "hits": hits,
+        "excluded": sorted(i for i in exclude if any(h["id"] == i for h in hits)),
+        "uncovered": sorted({h["placeholder"] for h in hits if h["id"] in exclude}),
     }
 
 
-def _redact_page_vector(page, usable, by_ph, fill=REDACT_FILL, text_color=REDACT_TEXT):
-    """Redazione VERA del layer testuale di una pagina (content stream).
+def _page_hits_vector(page, usable, by_ph, hits, next_id, pno):
+    """Le occorrenze da coprire nel layer testuale di una pagina.
 
-    Ritorna il numero di occorrenze redatte. Stessa logica di sempre: il
-    matching e' char-preciso e con confini di parola, e il testo viene rimosso
-    dal content stream con apply_redactions().
+    Non disegna niente: calcola solo la geometria (rettangoli + testo del
+    placeholder). Ritorna il prossimo id libero.
     """
     text, boxes = _page_char_index(page)
-    total = 0
+    if not text.strip():
+        return next_id
     taken = []
-    if text.strip():
-        for ph, val, pat in usable:
-            for m in pat.finditer(text):
-                rects = _match_rects(boxes, m)
-                placed_any, labeled = False, False
-                for r in rects:
-                    if _covered(r, taken):
-                        continue
-                    fs = 0 if labeled else _fit_fontsize(ph, r)
-                    _add_redact_annot(page, r, ph if fs else None,
-                                      fs or 6, fill, text_color)
-                    taken.append(fitz.Rect(r))
-                    placed_any = True
-                    labeled = labeled or bool(fs)
-                if placed_any:
-                    by_ph[ph] += 1
-                    total += 1
-    if taken:
+    for ph, val, pat in usable:
+        for m in pat.finditer(text):
+            rects = _match_rects(boxes, m)
+            placed, labeled = [], False
+            for r in rects:
+                if _covered(r, taken):
+                    continue
+                fs = 0 if labeled else _fit_fontsize(ph, r)
+                placed.append({"x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1,
+                               "fs": fs, "text": ph if fs else None})
+                taken.append(fitz.Rect(r))
+                labeled = labeled or bool(fs)
+            if placed:
+                hits.append({"id": next_id, "page": pno, "placeholder": ph,
+                             "kind": "vector", "rects": placed,
+                             "w": round(page.rect.width, 2),
+                             "h": round(page.rect.height, 2)})
+                by_ph[ph] += 1
+                next_id += 1
+    return next_id
+
+
+def _apply_hits_vector(page, hits, pno, exclude, fill, text_color):
+    """Disegna (e applaca) le redazioni vettoriali di una pagina.
+
+    Stessa logica di sempre: il matching e' char-preciso e con confini di
+    parola, e il testo viene rimosso dal content stream con apply_redactions().
+    Le occorrenze con id in `exclude` vengono saltate: restano in chiaro."""
+    n = 0
+    for h in hits:
+        if h["page"] != pno or h["id"] in exclude:
+            continue
+        for r in h["rects"]:
+            rect = fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"])
+            _add_redact_annot(page, rect, r.get("text"), r.get("fs") or 6,
+                              fill, text_color)
+            n += 1
+    if n:
         page.apply_redactions()   # rimozione VERA dal content stream
-    return total
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -483,45 +526,71 @@ def _redact_page_vector(page, usable, by_ph, fill=REDACT_FILL, text_color=REDACT
 # recuperabile con un pizzico di zucchero). L'originale sparisce, il risultato
 # e' un PDF di immagini con i placeholder scritti sopra.
 # --------------------------------------------------------------------------- #
-def _ocr_rects(lines, start, end):
-    """Rettangoli (in punti PDF) che coprono l'intervallo [start, end) del testo OCR."""
-    rects = []
-    for ln in lines:
-        s, e = ln.get("start", 0), ln.get("end", 0)
+def _ocr_rects(words, start, end):
+    """Rettangoli (in punti PDF) che coprono l'intervallo [start, end) del testo OCR.
+
+    Si lavora sulle PAROLE, non sulle righe: ogni parola ha il suo box, quindi
+    la casella copre esattamente la PII ("Mario Rossi") e non tutta la riga
+    ("Mario Rossi nato a Milano il 3 giu")."""
+    rects, cur = [], None
+    for w in words:
+        s, e = w.get("start", 0), w.get("end", 0)
         if e <= start or s >= end:
             continue
-        r = fitz.Rect(ln.get("x0", 0), ln.get("y0", 0),
-                      ln.get("x1", 0), ln.get("y1", 0))
-        if not r.is_empty:
-            rects.append(r)
+        r = fitz.Rect(w.get("x0", 0), w.get("y0", 0),
+                      w.get("x1", 0), w.get("y1", 0))
+        if r.is_empty:
+            continue
+        if cur is None:
+            cur = fitz.Rect(r)
+        elif r.y0 < cur.y1 and r.y1 > cur.y0:      # stessa riga: si fondono
+            cur |= r
+        else:                                       # riga diversa: casella nuova
+            rects.append(cur)
+            cur = fitz.Rect(r)
+    if cur is not None and not cur.is_empty:
+        rects.append(cur)
     return rects
 
 
-def _ocr_page_redactions(ocr_page, usable, by_ph):
-    """Le occorrenze da coprire in una pagina OCR: [(rect, placeholder)].
+def _page_words(ocr_page):
+    """Le parole della pagina OCR; se il motore non le ha date si cade sulle
+    righe (meno preciso, ma meglio di niente)."""
+    words = ocr_page.get("words") or []
+    if words:
+        return words, False
+    return ocr_page.get("lines") or [], True
+
+
+def _ocr_page_hits(ocr_page, usable, by_ph, hits, next_id, pno, w, h):
+    """Le occorrenze da coprire in una pagina OCR (geometria, senza disegnare).
 
     Il testo della pagina e' lo stesso che e' stato analizzato (e' l'OCR), quindi
     il matching dei valori e' identico a quello del layer testuale: stessi
-    pattern, stessi confini di parola.
+    pattern, stessi confini di parola. Le caselle pero' sono quelle delle
+    PAROLE coperte, non della riga intera.
     """
     text = ocr_page.get("text") or ""
-    lines = ocr_page.get("lines") or []
-    out, taken = [], []
+    words, _coarse = _page_words(ocr_page)
     if not text.strip():
-        return out
+        return next_id
+    taken = []
     for ph, val, pat in usable:
         for m in pat.finditer(text):
-            rects = _ocr_rects(lines, m.start(), m.end())
-            placed = False
+            rects = _ocr_rects(words, m.start(), m.end())
+            placed = []
             for r in rects:
                 if _covered(r, taken):
                     continue
                 taken.append(fitz.Rect(r))
-                out.append((fitz.Rect(r), ph))
-                placed = True
+                placed.append({"x0": r.x0, "y0": r.y0, "x1": r.x1, "y1": r.y1})
             if placed:
+                hits.append({"id": next_id, "page": pno, "placeholder": ph,
+                             "kind": "burnin", "rects": placed,
+                             "w": round(w, 2), "h": round(h, 2)})
                 by_ph[ph] += 1
-    return out
+                next_id += 1
+    return next_id
 
 
 def _raster_page(page, dpi):
@@ -534,11 +603,15 @@ def _raster_page(page, dpi):
 
 
 def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
-                   text_color=REDACT_TEXT):
+                   text_color=REDACT_TEXT, exclude=None):
     """PDF con pagine scansionate -> PDF anonimizzato (burn-in sulle scansioni).
 
     `ocr` e' il risultato di `ocr.ocr_pdf`: {"pages": [{"page": n, "text": ...,
-    "lines": [{"text", "x0", "y0", "x1", "y1", "start", "end"}]}]}.
+    "words": [{"text", "x0", "y0", "x1", "y1", "start", "end"}]}]}.
+
+    `exclude`: id di occorrenze da NON coprire (annullate dall'anteprima): i
+    pixel originali di quei punti restano nel file, quindi la PII torna
+    leggibile: finisce in `report["residual"]` e l'app avvisa.
 
     Le pagine con OCR vengono rasterizzate e annerite; le altre (layer testuale)
     vengono redatte come sempre, in vettore. Il risultato e' un PDF misto.
@@ -548,6 +621,7 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
     della scansione non restano nel file.
     """
     items, skipped, usable, by_ph, patterns = _prepare_items(mapping)
+    exclude = set(exclude or ())
     ocr_pages = {p.get("page"): p for p in (ocr or {}).get("pages", [])}
 
     try:
@@ -560,6 +634,8 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
 
     out_doc = fitz.open()
     total = 0
+    hits = []
+    next_id = 0
     try:
         for i in range(src.page_count):
             page = src.load_page(i)
@@ -572,20 +648,26 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
                     out_doc.insert_pdf(src, from_page=i, to_page=i,
                                        annots=False, links=False)
                 p2 = out_doc.load_page(out_doc.page_count - 1)
-                total += _redact_page_vector(p2, usable, by_ph, fill, text_color)
+                next_id = _page_hits_vector(p2, usable, by_ph, hits, next_id, i)
+                total += _apply_hits_vector(p2, hits, i, exclude, fill, text_color)
                 continue
 
             # pagina scansionata: raster + caselle nere dentro i pixel
-            hits = _ocr_page_redactions(op, usable, by_ph)
-            total += _count_ocr_matches(op, usable)
+            next_id = _ocr_page_hits(op, usable, by_ph, hits, next_id, i,
+                                     page.rect.width, page.rect.height)
             tmp = fitz.open()
             try:
                 tp = tmp.new_page(width=page.rect.width, height=page.rect.height)
                 pix = _raster_page(page, dpi)
                 tp.insert_image(tp.rect, pixmap=pix)
-                for r, _ph in hits:
-                    black = fitz.Rect(r.x0 - 1, r.y0 - 0.5, r.x1 + 1, r.y1 + 0.5)
-                    tp.draw_rect(black, color=None, fill=fill)
+                for h in hits:
+                    if h["page"] != i or h["id"] in exclude:
+                        continue
+                    for r in h["rects"]:
+                        rect = fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"])
+                        black = fitz.Rect(rect.x0 - 1, rect.y0 - 0.5,
+                                          rect.x1 + 1, rect.y1 + 0.5)
+                        tp.draw_rect(black, color=None, fill=fill)
                 # rasterizzo ANCHE le caselle: i pixel originali non restano nel file
                 pix2 = tp.get_pixmap(dpi=dpi)
             finally:
@@ -593,10 +675,15 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
 
             np_ = out_doc.new_page(width=page.rect.width, height=page.rect.height)
             np_.insert_image(np_.rect, pixmap=pix2)
-            for r, ph in hits:
-                fs = _fit_fontsize(ph, r)
-                if fs:
-                    _insert_placeholder(np_, r, ph, fs, text_color)
+            for h in hits:
+                if h["page"] != i or h["id"] in exclude:
+                    continue
+                for r in h["rects"]:
+                    rect = fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"])
+                    fs = _fit_fontsize(h["placeholder"], rect)
+                    if fs:
+                        _insert_placeholder(np_, rect, h["placeholder"], fs, text_color)
+            total += sum(1 for h in hits if h["page"] == i and h["id"] not in exclude)
     finally:
         src.close()
 
@@ -613,6 +700,7 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
     checked = [(ph, v) for ph, v in items if ph in by_ph]
     return out, {
         "occurrences": total,
+        "found": len(hits),
         "by_placeholder": by_ph,
         "not_found": [ph for ph, n in by_ph.items() if n == 0],
         "skipped": skipped,
@@ -622,6 +710,9 @@ def redact_pdf_ocr(pdf_bytes, mapping, ocr, dpi=200, fill=REDACT_FILL,
         "toc": n_toc,
         "embedded": n_emb,
         "ocr_pages": sorted(ocr_pages),
+        "hits": hits,
+        "excluded": sorted(i for i in exclude if any(h["id"] == i for h in hits)),
+        "uncovered": sorted({h["placeholder"] for h in hits if h["id"] in exclude}),
     }
 
 
@@ -644,17 +735,6 @@ def _insert_placeholder(page, rect, ph, fontsize, color):
         page.insert_text((x, y), ph, fontname="helv", fontsize=fontsize, color=color)
     except Exception:
         pass
-
-
-def _count_ocr_matches(ocr_page, usable):
-    """Occorrenze (match) trovate nel testo OCR di una pagina."""
-    text = ocr_page.get("text") or ""
-    n = 0
-    if not text.strip():
-        return 0
-    for _ph, _val, pat in usable:
-        n += sum(1 for _ in pat.finditer(text))
-    return n
 
 
 def _add_redact_annot(page, rect, text, fontsize, fill, text_color):

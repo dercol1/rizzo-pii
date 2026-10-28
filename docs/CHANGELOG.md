@@ -5,6 +5,34 @@ Le voci più recenti in alto. (Codice: `src/training/train_pii.py` salvo diverso
 
 ---
 
+## 2026-10-28 — OCR integrato: caselle per parola e coperture annullabili dall'anteprima
+
+Due problemi risolti insieme, entrambi sulla riga "scansioni" (documenti senza layer
+testuale, per i quali l'app esegue l'OCR e ridisegna la pagina in burn-in).
+
+**1. La casella copriva tutta la riga, non la PII.** Il motore riconosceva la pagina e il
+modulo `ocr.py` raggruppava le parole in righe: la redazione copriva quindi il rettangolo
+della riga intera ("Mario Rossi nato a Milano" → una striscia lunga tutta la riga). Ora il
+contratto del motore tiene anche le **parole** con il loro box (Tesseract le dà dal TSV,
+i motori per riga le hanno stimate dalla larghezza: `ocr._split_words_in_rect`) e
+`pdf_export._ocr_rects` unisce i box delle sole parole coperte dalla PII. Il resto della
+riga resta leggibile, il placeholder sta solo dove serve.
+
+**2. Una PII coperta per errore non si poteva togliere.** Ogni copertura ha ora un **id** e
+una geometria (`hits` nel report di `redact_pdf` / `redact_pdf_ocr`): la UI le disegna come
+overlay cliccabili sopra la pagina renderizzata e un click annulla quella copertura
+(`POST /doc/<id>/redactions {"excluded": [ids]}` → il server rigenera il PDF con quella
+occorrenza esclusa). La geometria dipende **solo** dal documento e dal dizionario, quindi
+annullare una copertura non sposta le altre. Il valore scoperto resta **in chiaro** e
+viene segnalato: `residual` per il layer testuale, `uncovered` per le pagine rasterizzate
+(dove la PII sta nei pixel e il controllo sul testo non la vede).
+
+Test: `tests/test_ocr_scansione.py` (casella per parola, stima delle parole, coperture
+annullabili e stabilità della geometria) e `tests/test_ocr_app.py` (annullare e
+ripristinare una copertura via API).
+
+---
+
 ## 2026-10-22 — Il PDF protetto da password si riconosce già al caricamento (`app.py`)
 
 Completa la voce del 2026-09-25: lì il server rispondeva già col messaggio chiaro, ma

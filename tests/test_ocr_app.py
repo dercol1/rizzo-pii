@@ -49,6 +49,16 @@ def pdf_scansionato():
     return out
 
 
+def pdf_con_testo(testo="Il bonifico va sull'IBAN IT60X0542811101000000123456."):
+    """PDF con layer testuale (niente OCR: il percorso normale)."""
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 100), testo, fontname="helv", fontsize=12)
+    out = doc.tobytes()
+    doc.close()
+    return out
+
+
 @unittest.skipIf(APP is None, "app.py non importabile (torch/flask/fitz assenti)")
 class OcrNellaApi(unittest.TestCase):
     def setUp(self):
@@ -125,6 +135,71 @@ class OcrNellaApi(unittest.TestCase):
         self.assertFalse(self.client.get("/settings").get_json()["ocr_enabled"])
         # ripristina (le preferenze sono su disco: non lasciare il server spento)
         self.client.post("/settings", json={"ocr_enabled": True})
+
+
+@unittest.skipIf(APP is None, "app.py non importabile (torch/flask/fitz assenti)")
+class CopertureAnnullabili(unittest.TestCase):
+    """L'anteprima permette di annullare la copertura di una PII coperta per
+    errore: un click sulla casella -> il server rigenera il PDF senza quella
+    copertura, e il documento viene segnalato come "valori rimasti in chiaro"."""
+
+    def setUp(self):
+        self._engine = APP.ocr.detect_engine
+        APP.ocr.detect_engine = lambda prefer=None, refresh=False: FakeEngine()
+        APP.OCR_ENABLED = True
+        APP._OCR_CACHE.clear()
+        self.client = APP.app.test_client()
+
+    def tearDown(self):
+        APP.ocr.detect_engine = self._engine
+        APP._OCR_CACHE.clear()
+
+    def _preview(self, pdf):
+        data = {"pdf": (io.BytesIO(pdf), "documento.pdf")}
+        r = self.client.post("/pdf/preview", data=data,
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        return r.get_json()
+
+    def _testo_del_file(self, doc_id):
+        pdf = self.client.get(f"/doc/{doc_id}/file.pdf")
+        with fitz.open(stream=pdf.data, filetype="pdf") as doc:
+            return "".join(p.get_text() for p in doc)
+
+    def test_l_anteprima_elenca_le_coperture(self):
+        d = self._preview(pdf_con_testo())
+        self.assertTrue(d["hits"])
+        h = d["hits"][0]
+        self.assertEqual(h["page"], 0)
+        self.assertEqual(h["placeholder"], "[IBAN_1]")
+        self.assertTrue(h["rects"])
+        self.assertGreater(h["w"], 0)
+
+    def test_annullare_la_copertura_riporta_il_valore_in_chiaro(self):
+        d = self._preview(pdf_con_testo())
+        self.assertNotIn(IBAN, self._testo_del_file(d["doc_id"]))
+        r = self.client.post(f"/doc/{d['doc_id']}/redactions",
+                             json={"excluded": [d["hits"][0]["id"]]})
+        self.assertEqual(r.status_code, 200)
+        d2 = r.get_json()
+        self.assertEqual(d2["excluded"], [d["hits"][0]["id"]])
+        self.assertEqual(d2["redactions"], 0)
+        self.assertGreaterEqual(d2["residual"], 1)      # avviso: resta in chiaro
+        self.assertIn(IBAN, self._testo_del_file(d["doc_id"]))
+
+    def test_ripristinare_la_copertura_rioccupa_il_valore(self):
+        d = self._preview(pdf_con_testo())
+        hid = d["hits"][0]["id"]
+        self.client.post(f"/doc/{d['doc_id']}/redactions", json={"excluded": [hid]})
+        r = self.client.post(f"/doc/{d['doc_id']}/redactions", json={"excluded": []})
+        d2 = r.get_json()
+        self.assertEqual(d2["excluded"], [])
+        self.assertEqual(d2["redactions"], d["redactions"])
+        self.assertNotIn(IBAN, self._testo_del_file(d["doc_id"]))
+
+    def test_il_documento_inesistente_da_errore(self):
+        r = self.client.post("/doc/inesistente/redactions", json={"excluded": []})
+        self.assertEqual(r.status_code, 404)
 
 
 if __name__ == "__main__":

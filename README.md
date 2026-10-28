@@ -604,7 +604,10 @@ and runs an OCR engine for you:
   anonymizable, with the same model and the same regex/checksum net;
 - the anonymized PDF is produced by **burn-in**: the page is rasterized and the PII
   boxes are painted **inside the pixels**, so the original scan (and the PII inside it)
-  is not recoverable from the file. The placeholder is written on top of the box.
+  is not recoverable from the file. The placeholder is written on top of the box;
+- the boxes cover the **word(s) of the PII**, not the whole line: Tesseract gives the
+  coordinates of every word, and for the line-based engines the words are estimated
+  from the width of the line.
 
 > Nothing leaves the machine: the OCR runs locally, like everything else.
 
@@ -616,7 +619,7 @@ needs one. Two engines are supported, the first available wins:
 | Engine | How to install | Notes |
 |---|---|---|
 | **Tesseract** (recommended) | `apt install tesseract-ocr tesseract-ocr-ita` · `brew install tesseract tesseract-lang` · [UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) on Windows | A system binary, no Python package. Best quality, **word-level** boxes: the redaction covers the exact word |
-| **RapidOCR / ONNX** | `pip install rapidocr-onnxruntime` | Pure pip, no system binary, the only one that can be bundled inside the desktop app. Recognises **lines**, so the redaction covers the whole line (safe, but it hides more context) |
+| **RapidOCR / ONNX** | `pip install rapidocr-onnxruntime` | Pure pip, no system binary, the only one that can be bundled inside the desktop app. Recognises **lines**, so the words are estimated from the line width: the redaction still covers the PII only, not the whole line |
 
 ```bash
 pip install rapidocr-onnxruntime      # or install Tesseract as a system package
@@ -656,6 +659,29 @@ If a scan arrives and the OCR cannot run, the answer is explicit instead of sile
 | `ocr_unavailable` | no engine installed — the message says what to install |
 | `ocr_disabled` | the switch is off |
 | `ocr_failed` | the engine failed (timeout, unreadable page) |
+
+### Cancel a redaction you do not want (interactive preview)
+
+Every redaction has an id. `POST /pdf/preview` returns them in `hits` (page, placeholder
+and rectangle — no original value travels), and the preview draws them as clickable boxes:
+
+```json
+{"hits": [{"id": 0, "page": 0, "placeholder": "[FULLNAME_1]", "kind": "burnin",
+           "w": 595.0, "h": 842.0, "rects": [[155.5, 109.8, 231.1, 122.0]]}]}
+```
+
+Clicking a box (the model covered something that was not a PII) cancels that single
+redaction: the server regenerates the PDF without it.
+
+```bash
+curl -X POST http://127.0.0.1:5005/doc/<doc_id>/redactions \
+     -H 'Content-Type: application/json' -d '{"excluded": [0]}'
+```
+
+The cancelled occurrence comes back **in clear**, so the answer reports it:
+`residual` counts the values left visible (`uncovered` for the rasterized pages, where
+the value lives in the pixels and cannot be checked in the text layer). Clicking again
+restores the redaction.
 
 ### Limits (deliberate)
 

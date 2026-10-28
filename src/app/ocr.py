@@ -32,6 +32,7 @@ strutture pure, quindi e' testabile in isolamento (come detectors/pdf_export).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -62,11 +63,17 @@ class OcrUnavailable(OcrError):
 # Motori
 # --------------------------------------------------------------------------- #
 class _Engine:
-    """Contratto di un motore: `recognize(png_bytes) -> [righe]`.
+    """Contratto di un motore: `recognize(png_bytes) -> [blocchi]`.
 
-    Una "riga" e' un pezzo di testo con il suo rettangolo: {"text": str,
-    "box": (x0, y0, x1, y1) in PIXEL, "conf": float}. Le coordinate sono in
-    pixel dell'immagine: chi chiama le converte in punti PDF (conosce la pagina).
+    Un "blocco" e' una riga riconosciuta: {"text": str, "box": (x0,y0,x1,y1)
+    in PIXEL, "conf": float, "words": [{"text","box","conf"}] | None}. Le
+    coordinate sono in pixel dell'immagine: chi chiama le converte in punti
+    PDF (conosce la pagina).
+
+    "words" e' la parte che conta: se il motore sa dove finisce ogni parola,
+    la redazione copre la PII e non l'intera riga. Se e' None (motori che
+    riconoscono per riga) le parole vengono stimate dal testo e dalla
+    larghezza della riga.
     """
 
     name = "?"
@@ -99,7 +106,7 @@ class TesseractEngine(_Engine):
         last_err = None
         for lang in self.langs:
             try:
-                return _tesseract_lines(self.exe, image_bytes, lang)
+                return _tesseract_blocks(self.exe, image_bytes, lang)
             except OcrError as e:
                 # Le lingue non installate fanno fallire Tesseract: si riprova
                 # con la catena di fallback (ita+eng -> eng -> default).
@@ -147,7 +154,7 @@ class OnnxEngine(_Engine):
                 res = engine(path)
             except Exception as e:
                 raise OcrError(f"RapidOCR: {e}") from e
-        return _rapidocr_lines(res)
+        return _rapidocr_blocks(res)
 
     def describe(self):
         return self.detail
@@ -174,6 +181,14 @@ def _find_tesseract():
 # --------------------------------------------------------------------------- #
 # Parsing dell'output dei motori
 # --------------------------------------------------------------------------- #
+# Un "blocco" e' una riga riconosciuta dal motore:
+#   {"text": str, "box": (x0,y0,x1,y1) in PIXEL, "conf": float,
+#    "words": [{"text", "box", "conf"}] | None}
+#
+# "words" e' None solo quando il motore riconosce per RIGA (RapidOCR): li' le
+# parole vengono ricavate dal testo e dalla larghezza del box (stima). Tutti
+# gli altri motori (Tesseract) danno la parola con le sue coordinate: e' il
+# livello di dettaglio giusto per coprire la PII e NON tutta la riga.
 def _union_box(boxes):
     xs0 = min(b[0] for b in boxes)
     ys0 = min(b[1] for b in boxes)
@@ -182,8 +197,8 @@ def _union_box(boxes):
     return (xs0, ys0, xs1, ys1)
 
 
-def _tesseract_lines(exe, image_bytes, lang):
-    """Tesseract su un PNG -> righe di testo con il box in pixel."""
+def _tesseract_blocks(exe, image_bytes, lang):
+    """Tesseract su un PNG -> blocchi (righe) con le coordinate delle PAROLE."""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "page.png")
         with open(path, "wb") as fh:
@@ -205,8 +220,11 @@ def _tesseract_lines(exe, image_bytes, lang):
 
 
 def _parse_tsv(tsv):
-    """TSV di Tesseract -> righe. Le parole (level 5) sono raggruppate per
-    (blocco, paragrafo, riga): una riga = testo + box che la contiene."""
+    """TSV di Tesseract -> blocchi (righe) con le parole al loro interno.
+
+    Le parole (level 5) sono raggruppate per (blocco, paragrafo, riga): la
+    riga e' il testo, ma ogni PAROLA mantiene il suo box: e' quello che permette
+    di coprire solo la PII invece di tutta la riga."""
     words, header = [], False
     for raw in tsv.splitlines():
         if not header:
@@ -233,32 +251,43 @@ def _parse_tsv(tsv):
     groups = {}
     for w in words:
         groups.setdefault(w["key"], []).append(w)
-    lines = []
-    for key, ws in groups.items():
-        text = " ".join(w["text"] for w in ws)
-        lines.append({"text": text, "box": _union_box([w["box"] for w in ws]),
-                      "conf": min(w["conf"] for w in ws) / 100.0})
-    return lines
+    blocks = []
+    for ws in groups.values():
+        txt = " ".join(w["text"] for w in ws)
+        blocks.append({
+            "text": txt,
+            "box": _union_box([w["box"] for w in ws]),
+            "conf": min(w["conf"] for w in ws) / 100.0,
+            "words": [{"text": w["text"], "box": w["box"], "conf": w["conf"] / 100.0}
+                      for w in ws],
+        })
+    return blocks
 
 
-def _rapidocr_lines(res):
-    """RapidOCR -> righe. Due forme di risultato:
+def _rapidocr_blocks(res):
+    """RapidOCR -> blocchi (righe). Due forme di risultato:
       - v1: lista di [box, text, score] (box = 4 punti)
       - v2: oggetto con .boxes / .txts / .scores
+    Le parole NON ci sono: il modello riconosce per riga, e le parole
+    vengono stimate dal testo e dalla larghezza della riga.
     """
     if res is None:
         return []
-    lines = []
     if isinstance(res, tuple):             # (risultato, elapsed)
         res = res[0]
     if res is None:
         return []
+    blocks = []
     # forma v2
     if hasattr(res, "txts") and hasattr(res, "boxes"):
-        for box, txt, sc in zip(res.boxes, res.txts, getattr(res, "scores", [1.0] * len(res.txts))):
-            lines.append({"text": str(txt).strip(), "box": _poly_box(box),
-                          "conf": float(sc)})
-        return [ln for ln in lines if ln["text"]]
+        scores = getattr(res, "scores", None)
+        for i, (box, txt) in enumerate(zip(res.boxes, res.txts)):
+            sc = float(scores[i]) if scores is not None else 1.0
+            t = str(txt).strip()
+            if not t:
+                continue
+            blocks.append({"text": t, "box": _poly_box(box), "conf": sc, "words": None})
+        return blocks
     # forma v1
     try:
         items = list(res)
@@ -269,11 +298,11 @@ def _rapidocr_lines(res):
             box, txt, sc = it[0], it[1], it[2]
         except (TypeError, IndexError):
             continue
-        txt = str(txt).strip()
-        if not txt:
+        t = str(txt).strip()
+        if not t:
             continue
-        lines.append({"text": txt, "box": _poly_box(box), "conf": float(sc)})
-    return lines
+        blocks.append({"text": t, "box": _poly_box(box), "conf": float(sc), "words": None})
+    return blocks
 
 
 def _poly_box(box):
@@ -406,6 +435,43 @@ def scanned_pages(doc, min_chars=OCR_MIN_CHARS_PER_PAGE):
     return out
 
 
+def _split_words_in_rect(text, rect):
+    """Stima le parole di una riga a partire dal testo e dal suo rettangolo.
+
+    Serve per i motori che riconoscono per RIGA (RapidOCR): la riga e' un unico
+    box, ma la redazione deve coprire la PII e non tutta la riga. Le parole
+    vengono distribuite sulla larghezza del box in proporzione alla larghezza
+    REALE dei glifi (helv, corpo = altezza del box): e' un'approssimazione, ma
+    molto piu' vicina al vero di "tutta la riga".
+    """
+    spans = [(m.start(), m.end(), m.group())
+             for m in re.finditer(r"\S+", text or "")]
+    if not spans:
+        return []
+    fs = max(rect.height, 1.0)
+    widths = []
+    for _s, _e, w in spans:
+        try:
+            wl = fitz.get_text_length(w, fontname="helv", fontsize=fs)
+        except Exception:
+            wl = 0.0
+        widths.append(max(wl, 0.1))
+    total = sum(widths)
+    if total <= 0:
+        total = 1.0
+    # il box della riga e' la misura vera della riga: le parole vengono
+    # distribuite su tutta la sua larghezza, in proporzione alla larghezza
+    # dei glifi. Il risultato e' una stima (il motore non ha dato le parole),
+    # ma molto piu' vicino al vero di "tutta la riga".
+    scale = rect.width / total if rect.width > 0 else 1.0
+    out, x = [], rect.x0
+    for (_s, _e, w), wl in zip(spans, widths):
+        ww = wl * scale
+        out.append({"text": w, "box": (x, rect.y0, x + ww, rect.y1)})
+        x += ww
+    return out
+
+
 def ocr_pdf(pdf_bytes, pages=None, dpi=OCR_DPI, lang=DEFAULT_LANG, engine=None):
     """OCR delle pagine indicate (o di tutte) di un PDF.
 
@@ -414,9 +480,15 @@ def ocr_pdf(pdf_bytes, pages=None, dpi=OCR_DPI, lang=DEFAULT_LANG, engine=None):
         "engine": "tesseract", "dpi": 200, "lang": "ita+eng", "seconds": 3.4,
         "pages": [{"page": 0, "width": 595, "height": 842, "text": "...",
                    "lines": [{"text": "...", "x0":.., "y0":.., "x1":.., "y1":..,
-                              "conf": 0.98, "start": 0, "end": 12}]}],
+                              "conf": 0.98, "start": 0, "end": 12}],
+                   "words": [{"text": "...", "x0":.., "y0":.., "x1":.., "y1":..,
+                              "conf": 0.98, "start": 0, "end": 5}]}],
         "text": "testo di tutte le pagine, separate da \\n"
       }
+
+    "words" e' il livello che serve alla redazione: il box di ogni PAROLA, con
+    gli offset del suo testo nella pagina. "lines" resta per compatibilita' (e
+    come fallback se un motore non sa dare le parole).
 
     Le coordinate sono in PUNTI PDF con origine in alto a sinistra (convenzione
     PyMuPDF, la stessa di `pdf_export._page_char_index`): cosi' il rettangolo
@@ -443,23 +515,55 @@ def ocr_pdf(pdf_bytes, pages=None, dpi=OCR_DPI, lang=DEFAULT_LANG, engine=None):
             rect = page.rect
             pix = page.get_pixmap(dpi=dpi)
             png = pix.tobytes("png")
-            lines = engine.recognize(png) or []
+            blocks = engine.recognize(png) or []
             scale = 72.0 / dpi          # pixel -> punti PDF
-            text_parts, plines = [], []
+            text_parts, plines, pwords = [], [], []
             cursor = 0
-            for ln in lines:
-                txt = (ln.get("text") or "").strip()
+            for blk in blocks:
+                txt = (blk.get("text") or "").strip()
                 if not txt:
                     continue
-                box = ln.get("box") or (0, 0, 0, 0)
+                box = blk.get("box") or (0, 0, 0, 0)
                 x0, y0, x1, y1 = [v * scale for v in box]
-                plines.append({
+                line = {
                     "text": txt,
                     "x0": round(x0, 2), "y0": round(y0, 2),
                     "x1": round(x1, 2), "y1": round(y1, 2),
-                    "conf": float(ln.get("conf") or 0.0),
+                    "conf": float(blk.get("conf") or 0.0),
                     "start": cursor, "end": cursor + len(txt),
-                })
+                }
+                plines.append(line)
+                # le parole: quelle del motore, se le ha, altrimenti stimate
+                raw_words = blk.get("words") or None
+                if raw_words:
+                    est = [{"text": (w.get("text") or "").strip(),
+                            "box": w.get("box") or (0, 0, 0, 0),
+                            "conf": float(w.get("conf") or 0.0)}
+                           for w in raw_words]
+                    est = [w for w in est if w["text"]]
+                else:
+                    # stima nel sistema dei PIXEL (come i box del motore): la
+                    # scala si applica dopo, a tutto insieme
+                    est = [{"text": w["text"], "box": w["box"], "conf": 0.0}
+                           for w in _split_words_in_rect(txt, fitz.Rect(*box))]
+                # gli offset delle parole dentro il testo della pagina
+                wcursor = cursor
+                for w in est:
+                    t = w["text"]
+                    pos = txt.find(t, wcursor - cursor)
+                    if pos < 0:
+                        pos = txt.find(t)
+                    if pos < 0:
+                        continue
+                    wcursor = cursor + pos + len(t)
+                    bx = w["box"]
+                    pwords.append({
+                        "text": t,
+                        "x0": round(bx[0] * scale, 2), "y0": round(bx[1] * scale, 2),
+                        "x1": round(bx[2] * scale, 2), "y1": round(bx[3] * scale, 2),
+                        "conf": float(w.get("conf") or 0.0),
+                        "start": cursor + pos, "end": cursor + pos + len(t),
+                    })
                 text_parts.append(txt)
                 cursor += len(txt) + 1     # il "\n" fra una riga e l'altra
             out_pages.append({
@@ -468,6 +572,7 @@ def ocr_pdf(pdf_bytes, pages=None, dpi=OCR_DPI, lang=DEFAULT_LANG, engine=None):
                 "height": round(rect.height, 2),
                 "text": "\n".join(text_parts),
                 "lines": plines,
+                "words": pwords,
             })
     return {
         "engine": engine.name,

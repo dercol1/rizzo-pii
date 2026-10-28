@@ -150,7 +150,8 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   Motori in plug-in, il primo disponibile vince: **Tesseract** (binario di sistema, qualità migliore,
   box **per parola** → la redazione copre la parola esatta) e **RapidOCR/ONNX**
   (`pip install rapidocr-onnxruntime`, nessun binario, l'unico impacchettabile nel Tauri/PyInstaller,
-  box **per riga** → la redazione copre tutta la riga). Nessuna dipendenza obbligatoria: senza
+  box **per riga** → le parole vengono stimate dalla larghezza della riga, e la redazione copre
+  comunque solo la PII, non tutta la riga). Nessuna dipendenza obbligatoria: senza
   motore l'app funziona come prima e l'errore (`code: ocr_unavailable`) dice cosa installare.
   Il testo riconosciuto entra nell'analisi come qualsiasi altro testo; il PDF viene redatto in
   **burn-in** (`pdf_export.redact_pdf_ocr`): la pagina è rasterizzata e le caselle sono annerite
@@ -159,6 +160,13 @@ modelli in `models/<versione>/`, artefatti dei run in `experiments/<run>/`, doc 
   Switch "OCR automatico" nella UI, `ocr_enabled` in `prefs.json`,
   env `PII_OCR=0`, CLI `--no-ocr`. Il risultato dell'OCR è **cachato in memoria** per hash del file
   (`_OCR_CACHE`): /preview, /analyze e /pdf/preview non riconoscono due volte lo stesso file.
+- **Coperture annullabili dall'anteprima** — ogni redazione ha un id (`hits` nel report di
+  `redact_pdf`/`redact_pdf_ocr`): la UI disegna le caselle come overlay cliccabili e un click
+  annulla la copertura di una PII coperta per errore. `POST /doc/<id>/redactions
+  {"excluded": [ids]}` rigenera il PDF senza quelle coperture (la geometria non si sposta:
+  dipende solo dal documento e dal dizionario). I valori così scoperti restano **in chiaro** e
+  vengono segnalati con `residual` / `uncovered` (nel burn-in stanno nei pixel: il controllo
+  dei residui sul testo non li vede).
 - `serve.py` — entry **headless** (solo Flask, niente browser): è il backend dell'app Tauri; log su
   `%LOCALAPPDATA%\rizzo-pii\backend.log`. Pre-check porta + `sys.exit(76)` se occupata.
   `desktop_app.py` — entry PyInstaller legacy (apre il browser); stesso pre-check.

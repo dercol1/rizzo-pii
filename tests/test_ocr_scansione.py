@@ -48,6 +48,32 @@ class FakeEngine:
         return self.detail
 
 
+class FakeParoleEngine:
+    """Motore finto che sa dove finisce ogni PAROLA (come fa Tesseract).
+
+    Le coordinate sono in punti pagina: il motore le restituisce in pixel,
+    quindi qui si moltiplica per 200/72 (i pixel del rendering a 200 DPI).
+    """
+
+    name = "fake"
+    detail = "motore finto di test"
+
+    # (testo, x0, x1) in PUNTI
+    PAROLE = [("Mario", 50, 120), ("Rossi", 130, 190), ("nato", 200, 250),
+              ("a", 260, 275), ("Milano", 285, 360)]
+
+    def recognize(self, image_bytes):
+        px = 200.0 / 72.0
+        words = [{"text": t, "box": (x0 * px, 100 * px, x1 * px, 120 * px),
+                  "conf": 0.9} for t, x0, x1 in self.PAROLE]
+        return [{"text": " ".join(t for t, _x0, _x1 in self.PAROLE),
+                 "box": (50 * px, 100 * px, 360 * px, 120 * px),
+                 "conf": 0.9, "words": words}]
+
+    def describe(self):
+        return self.detail
+
+
 def pdf_scansionato(pagine=1):
     """PDF con immagine e SENZA testo: la classica scansione."""
     doc = fitz.open()
@@ -168,6 +194,89 @@ class MotoreNonInstallato(unittest.TestCase):
         self.assertIn("engine", st)
         if not st["available"]:
             self.assertIn("tesseract", st["detail"].lower())
+
+
+class CoordinatePerParola(unittest.TestCase):
+    """La casella deve coprire la PII, non TUTTA la riga.
+
+    Prima la copertura era la riga intera (la parola veniva unita alle altre
+    dal box unico del motore): "Mario Rossi nato a Milano" diventava una
+    striscia viola lunga tutta la riga. Ora il box e' quello delle parole.
+    """
+
+    def _redige(self, engine, mapping=None):
+        pdf = pdf_scansionato()
+        res = ocr.ocr_pdf(pdf, pages=[0], dpi=200, engine=engine)
+        out, report = pdf_export.redact_pdf_ocr(
+            pdf, mapping or {"[FULLNAME_1]": "Mario Rossi"}, res, dpi=200)
+        return res, report
+
+    def test_il_motore_che_conosce_le_parole_copre_solo_quelle(self):
+        _res, report = self._redige(FakeParoleEngine())
+        self.assertEqual(report["occurrences"], 1)
+        rect = report["hits"][0]["rects"][0]
+        self.assertAlmostEqual(rect["x0"], 50, places=0)    # da "Mario"
+        self.assertAlmostEqual(rect["x1"], 190, places=0)   # a "Rossi"
+        # la riga finiva a 360: la casella NON arriva li'
+        self.assertLess(rect["x1"], 360)
+
+    def test_il_motore_per_riga_stima_le_parole(self):
+        """Senza le parole (RapidOCR) le caselle sono stimate: piu' strette
+        della riga, ma non esatte."""
+        res = ocr.ocr_pdf(pdf_scansionato(), pages=[0], dpi=200,
+                          engine=FakeEngine([{"text": "Mario Rossi nato a Milano",
+                                               "box": (50 * 200 / 72., 100 * 200 / 72.,
+                                                       360 * 200 / 72., 120 * 200 / 72.),
+                                               "conf": 0.9}]))
+        page = res["pages"][0]
+        self.assertEqual(len(page["words"]), 5)
+        for w in page["words"]:
+            self.assertEqual(page["text"][w["start"]:w["end"]], w["text"])
+        # le parole stimate crescono da sinistra a destra e restano dentro la riga
+        xs = [w["x0"] for w in page["words"]]
+        self.assertEqual(xs, sorted(xs))
+        self.assertLessEqual(page["words"][-1]["x1"], 361)
+        out, report = pdf_export.redact_pdf_ocr(
+            pdf_scansionato(), {"[FULLNAME_1]": "Mario Rossi"}, res, dpi=200)
+        rect = report["hits"][0]["rects"][0]
+        self.assertLess(rect["x1"], 360)      # non tutta la riga
+        self.assertGreater(rect["x1"], 150)   # ma non solo la prima parola
+
+class OccorrenzeAnnullabili(unittest.TestCase):
+    """Ogni copertura ha un id: l'utente puo' annullarla dall'anteprima."""
+
+    def _redige(self, exclude=None):
+        pdf = pdf_scansionato()
+        res = ocr.ocr_pdf(pdf, pages=[0], dpi=200, engine=FakeParoleEngine())
+        out, report = pdf_export.redact_pdf_ocr(
+            pdf, {"[FULLNAME_1]": "Mario Rossi"}, res, dpi=200, exclude=exclude)
+        return out, report
+
+    def test_il_report_elenca_le_coperture(self):
+        _out, report = self._redige()
+        self.assertEqual(report["found"], 1)
+        self.assertEqual(report["hits"][0]["id"], 0)
+        self.assertEqual(report["hits"][0]["placeholder"], "[FULLNAME_1]")
+
+    def test_annullando_la_copertura_la_pii_torna_in_chiaro(self):
+        out, report = self._redige(exclude={0})
+        self.assertEqual(report["occurrences"], 0)      # niente coperto
+        self.assertEqual(report["found"], 1)            # ma era stata trovata
+        self.assertEqual(report["excluded"], [0])
+        self.assertEqual(report["uncovered"], ["[FULLNAME_1]"])
+        with fitz.open(stream=out, filetype="pdf") as doc:
+            # i pixel originali sono rimasti: la casella non e' stata disegnata
+            pix = doc.load_page(0).get_pixmap(dpi=200)
+        i = (215 * pix.width + 250) * pix.n
+        self.assertEqual(tuple(pix.samples[i:i + 3]), (255, 255, 255))
+
+    def test_la_geometria_non_cambia_annullando_una_copertura(self):
+        """Annullare una copertura non deve spostare le altre: i rettangoli
+        dipendono solo dal documento e dal dizionario."""
+        _out, report = self._redige()
+        rect = dict(report["hits"][0]["rects"][0])
+        _out2, report2 = self._redige(exclude={0})
+        self.assertEqual(report2["hits"][0]["rects"][0], rect)
 
 
 if __name__ == "__main__":

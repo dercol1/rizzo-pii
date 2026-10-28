@@ -31,6 +31,10 @@ Endpoint HTTP:
                   il PDF anonimizzato resta in memoria e si guarda pagina per pagina
   GET  /doc/<id>/page/<n>.png   pagina renderizzata (anteprima a video)
   GET  /doc/<id>/file.pdf       download del documento tenuto in memoria
+  POST /doc/<id>/redactions  {"excluded": [id, ...]} -> ANNULLA la copertura di
+                  quelle occorrenze (una PII coperta per errore) e rigenera il
+                  PDF: le occorrenze escluse restano in chiaro e il documento
+                  viene segnalato con "residual"
   GET  /settings  legenda dei 23 tag, tag esclusi, stato del dizionario reversibile,
                   stato dell'OCR (motore installato, switch automatico)
   POST /settings  {"excluded_tags": [...], "mapping_enabled": bool, "ocr_enabled": bool}
@@ -44,6 +48,15 @@ altro testo, e il PDF viene redatto in "burn-in" (le caselle vengono annerite
 DENTRO i pixel, cosi' la PII non resta recuperabile nel file). Lo switch "OCR
 automatico" lo disattiva; senza alcun motore installato l'app funziona come
 prima e dice cosa installare.
+
+Le caselle coprono la PAROLA (o le parole) della PII, non tutta la riga:
+Tesseract da' le coordinate di ogni parola, RapidOCR riconosce per riga e le
+parole vengono stimate dalla larghezza della riga.
+
+Anteprima interattiva: ogni copertura ha un id ("hits" nella risposta di
+/pdf/preview). Un click su una casella la annulla e il server rigenera il PDF
+senza quella copertura: serve quando il modello ha coperto per errore una
+parola che non era una PII.
 
 Avvio:  python app.py   ->   http://127.0.0.1:5005
 Configurazione host/porta (precedenza): CLI --host/--port > env PII_HOST/PII_PORT >
@@ -208,14 +221,19 @@ def _safe_name(name, default="documento.pdf"):
     return base or default
 
 
-def _store_doc(data, name="documento.pdf"):
-    """Mette un PDF nello store dell'anteprima. Ritorna (doc_id, n_pages)."""
+def _store_doc(data, name="documento.pdf", plan=None):
+    """Mette un PDF nello store dell'anteprima. Ritorna (doc_id, n_pages).
+
+    `plan` e' la "ricetta" del documento (originale + dizionario + OCR): serve
+    a rigenerare il PDF quando l'utente annulla una copertura dall'anteprima.
+    Resta in memoria, come il documento: mai su disco.
+    """
     with fitz.open(stream=data, filetype="pdf") as doc:
         n_pages = doc.page_count
     doc_id = secrets.token_urlsafe(12)
     with _DOCS_LOCK:
         _DOCS[doc_id] = {"pdf": data, "pages": {}, "n_pages": n_pages,
-                         "name": _safe_name(name)}
+                         "name": _safe_name(name), "plan": plan, "v": 1}
         while len(_DOCS) > MAX_DOCS:
             _DOCS.popitem(last=False)
     return doc_id, n_pages
@@ -817,7 +835,13 @@ def _build_anonymized_pdf():
     reversibile disattivato (MAPPING_ENABLED=False), dove il client non ne ha
     nessuno.
 
-    Ritorna (bytes, report, n_redazioni, nome_file). Solleva _ReqError sugli errori.
+    Ritorna (bytes, report, n_redazioni, nome_file, plan). Solleva _ReqError
+    sugli errori.
+
+    Il `plan` e' la ricetta per rigenerare lo stesso PDF con un insieme diverso
+    di redazioni (le occorrenze che l'utente ha annullato dall'anteprima):
+    contiene l'originale, il dizionario e il risultato dell'OCR. Resta tutto in
+    memoria, lato server: il dizionario non viaggia mai verso il client.
     """
     up = _uploaded_file()
     meta = {}
@@ -863,11 +887,13 @@ def _build_anonymized_pdf():
                 out, report = pdf_export.redact_pdf(data, res["mapping"])
         except pdf_export.PdfError as e:
             raise _ReqError(str(e))
-        if report["occurrences"] == 0:
+        if report["found"] == 0:
             raise _ReqError("Nessuna occorrenza trovata nel PDF: il testo "
                             "riconosciuto dall'OCR non contiene nessuna PII "
                             "rilevata (prova a rivedere la scansione).", 422)
-        return out, report, report["occurrences"], out_name
+        plan = {"mode": "pdf", "src": data, "mapping": res["mapping"],
+                "ocr": ocr_res}
+        return out, report, report["occurrences"], out_name, plan
 
     try:
         out = pdf_export.text_to_pdf(res["anonymized_text"])
@@ -875,17 +901,63 @@ def _build_anonymized_pdf():
         raise _ReqError(str(e))
     # testo reimpaginato da zero: nell'output c'e' solo il testo anonimizzato,
     # quindi niente residui e niente valori saltati da segnalare.
-    return out, {}, res["n_entities"], out_name
+    plan = {"mode": "text", "text": res["anonymized_text"]}
+    return out, {}, res["n_entities"], out_name, plan
 
 
 @app.route("/pdf", methods=["POST"])
 def pdf_route():
     """Scarica il documento ANONIMIZZATO in PDF (vedi _build_anonymized_pdf)."""
     try:
-        out, report, redactions, name = _build_anonymized_pdf()
+        out, report, redactions, name, _plan = _build_anonymized_pdf()
     except _ReqError as e:
         return jsonify({"error": e.msg}), e.status
     return _pdf_response(out, report, redactions, name)
+
+
+def _doc_descriptor(doc_id, report, redactions, name, n_pages, ocr_pages=None, v=1):
+    """Il descrittore del documento (stesso formato di /pdf/preview)."""
+    # i valori rimasti in chiaro: quelli che il controllo dei residui trova nel
+    # testo E quelli che l'utente ha scoperto annullando una copertura (nel
+    # burn-in stanno nei pixel: il controllo sul testo non li vede)
+    resid = set(report.get("residual") or [])
+    resid |= set(report.get("uncovered") or [])
+    body = {
+        "doc_id": doc_id,
+        "n_pages": n_pages,
+        "filename": name,
+        "redactions": redactions,
+        "residual": len(resid),
+        "skipped": len(report.get("skipped", [])),
+        "not_found": len(report.get("not_found", [])),
+        "found": report.get("found", redactions),
+        "hits": _public_hits(report.get("hits") or []),
+        "excluded": report.get("excluded", []),
+        "v": v,
+    }
+    if ocr_pages:
+        body["ocr_pages"] = ocr_pages
+    return body
+
+
+def _public_hits(hits):
+    """Le occorrenze con la loro geometria, per l'anteprima interattiva.
+
+    Non contiene nulla di riservato: solo id, pagina, placeholder e rettangoli
+    (i valori originali restano lato server)."""
+    out = []
+    for h in hits:
+        out.append({
+            "id": h.get("id"),
+            "page": h.get("page"),
+            "placeholder": h.get("placeholder"),
+            "kind": h.get("kind"),
+            "w": h.get("w") or 0,
+            "h": h.get("h") or 0,
+            "rects": [[r.get("x0", 0), r.get("y0", 0), r.get("x1", 0), r.get("y1", 0)]
+                      for r in (h.get("rects") or [])],
+        })
+    return out
 
 
 @app.route("/pdf/preview", methods=["POST"])
@@ -897,23 +969,63 @@ def pdf_preview_route():
     Serve a non anonimizzare due volte: l'anteprima a destra e il download del PDF
     usano lo STESSO documento, generato una volta sola."""
     try:
-        out, report, redactions, name = _build_anonymized_pdf()
+        out, report, redactions, name, plan = _build_anonymized_pdf()
     except _ReqError as e:
         return jsonify({"error": e.msg}), e.status
-    doc_id, n_pages = _store_doc(out, name)
-    body = {
-        "doc_id": doc_id,
-        "n_pages": n_pages,
-        "filename": name,
-        "redactions": redactions,
-        "residual": len(report.get("residual", [])),
-        "skipped": len(report.get("skipped", [])),
-        "not_found": len(report.get("not_found", [])),
-    }
+    doc_id, n_pages = _store_doc(out, name, plan)
+    body = _doc_descriptor(doc_id, report, redactions, name, n_pages,
+                           report.get("ocr_pages"), 1)
     # le pagine redatte in burn-in (scansioni): l'UI avvisa che il PDF e' stato
     # rasterizzato e che quelle pagine non hanno piu' testo selezionabile
-    if report.get("ocr_pages"):
-        body["ocr_pages"] = report["ocr_pages"]
+    return jsonify(body)
+
+
+@app.route("/doc/<doc_id>/redactions", methods=["POST"])
+def doc_redactions(doc_id):
+    """Annulla (o ripristina) la copertura di una singola redazione.
+
+    Nell'anteprima ogni casella e' cliccabile: se l'utente vede che una PII e'
+    stata coperta per errore (un numero che non era una PII, un nome che il
+    modello ha inventato) la "scopare" con un click. Il server rigenera il
+    PDF con quella occorrenza esclusa: la PII torna in chiaro e il documento
+    viene segnalato come "valori rimasti in chiaro" (residual).
+
+    Body: {"excluded": [id, ...]} (l'insieme completo delle occorrenze da
+    lasciare in chiaro). Risponde con il descrittore del documento rigenerato.
+    """
+    d = _get_doc(doc_id)
+    if d is None:
+        return jsonify({"error": "Documento non trovato o scaduto."}), 404
+    plan = d.get("plan") or {}
+    if plan.get("mode") != "pdf":
+        return jsonify({"error": "Questo documento non ha redazioni "
+                                 "annullabili."}), 400
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get("excluded")
+    if raw is None:
+        return jsonify({"error": "Specificare 'excluded'."}), 400
+    try:
+        excluded = set(int(i) for i in raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "'excluded' deve essere una lista di id."}), 400
+
+    try:
+        if plan.get("ocr"):
+            out, report = pdf_export.redact_pdf_ocr(plan["src"], plan["mapping"],
+                                                    plan["ocr"], exclude=excluded)
+        else:
+            out, report = pdf_export.redact_pdf(plan["src"], plan["mapping"],
+                                                exclude=excluded)
+    except pdf_export.PdfError as e:
+        return jsonify({"error": str(e)}), 400
+
+    with _DOCS_LOCK:
+        d["pdf"] = out
+        d["pages"].clear()          # le pagine renderizzate cambiano
+        d["v"] = int(d.get("v") or 1) + 1
+        v = d["v"]
+    body = _doc_descriptor(doc_id, report, report["occurrences"], d["name"],
+                           d["n_pages"], report.get("ocr_pages"), v)
     return jsonify(body)
 
 
@@ -1488,6 +1600,18 @@ PAGE = r"""
   .pdfbusy{display:flex;align-items:center;justify-content:center;gap:10px;height:100%;
            color:var(--muted);font-size:13.5px;font-weight:600}
   .pdfbusy .spin{border-color:rgba(124,58,158,.25);border-top-color:var(--brand)}
+  /* le caselle di redazione sono cliccabili: se una PII e' stata coperta per
+     errore, un click la "scopare" (il server rigenera il PDF senza quella
+     copertura). La casella annullata resta evidenziata col bordo tratteggiato. */
+  .pdfview .hit{position:absolute;z-index:2;border:1.5px solid rgba(124,58,158,.95);
+                border-radius:3px;background:rgba(124,58,158,.10);cursor:pointer;
+                transition:background .12s,border-color .12s}
+  .pdfview .hit:hover{background:rgba(124,58,158,.32);border-color:#4d2268}
+  .pdfview .hit.off{border:1.5px dashed rgba(196,44,44,.95);background:rgba(196,44,44,.10)}
+  .pdfview .hit.off:hover{background:rgba(196,44,44,.24)}
+  .pdfview .hithint{background:#fff8e6;border:1px solid #edd9a4;color:#6a5312;
+                    font-size:12.5px;line-height:1.45;padding:8px 11px;border-radius:8px;
+                    margin:0 0 10px}
 
   .preview{white-space:pre-wrap;word-wrap:break-word;font-size:14.5px;line-height:1.7}
   .ph{border-radius:6px;padding:1px 7px 2px;font-weight:600;font-size:12.5px;cursor:help;
@@ -1958,6 +2082,13 @@ const T = {
   ocr_badge:(e,p,s)=>"OCR · "+e+" · "+p+" pagine · "+s+" s",
   ocr_burnin:"Le pagine scansionate sono state rasterizzate per coprire le PII: in quelle pagine il testo non è più selezionabile.",
   t_ocr_missing:"Serve l'OCR ma nessun motore è installato. Installa Tesseract oppure rapidocr-onnxruntime.",
+  t_hit_hint:"Le caselle viola sono le PII coperte: se una è stata coperta per errore, cliccala per annullare la copertura (la PII torna in chiaro nel PDF: controlla il file prima di condividerlo).",
+  t_hit_cancel:"Annulla la copertura di questa PII",
+  t_hit_restore:"Ripristina la copertura di questa PII",
+  t_hit_off:"Copertura annullata: la PII torna in chiaro nel PDF.",
+  t_hit_on:"Copertura ripristinata.",
+  t_hit_done:"PDF aggiornato",
+  t_hit_warn:n=>"ATTENZIONE: "+n+" valori sono rimasti in chiaro nel PDF: controlla il file prima di condividerlo",
  },
  en:{
   tagline:"local model on CPU · GDPR compliant", badge:"100% local",
@@ -2031,6 +2162,13 @@ const T = {
   t_ocr_on:"Automatic OCR on", t_ocr_off:"Automatic OCR off",
   ocr_badge:(e,p,s)=>"OCR · "+e+" · "+p+" pages · "+s+" s",
   ocr_burnin:"Scanned pages were rasterized to cover the PII: in those pages the text is no longer selectable.",
+  t_hit_hint:"The violet boxes are the redacted PII: if one was redacted by mistake, click it to cancel the redaction (the value becomes visible again in the PDF: check the file before sharing it).",
+  t_hit_cancel:"Cancel the redaction of this PII",
+  t_hit_restore:"Restore the redaction of this PII",
+  t_hit_off:"Redaction cancelled: the value is visible again in the PDF.",
+  t_hit_on:"Redaction restored.",
+  t_hit_done:"PDF updated",
+  t_hit_warn:n=>"WARNING: "+n+" values were left in clear in the PDF: check the file before sharing it",
   t_ocr_missing:"OCR is needed but no engine is installed. Install Tesseract or rapidocr-onnxruntime.",
  }
 };
@@ -2081,20 +2219,71 @@ function toast(msg,ok=true,ms=1800){const t=$('toast');t.textContent=msg;t.class
    niente viewer PDF del browser (dentro Tauri non c'e' garanzia che ci sia) e
    niente libreria JS esterna (l'app e' offline, nessuna CDN raggiungibile).
    `loading=lazy` -> un PDF di 200 pagine non scarica 200 immagini all'apertura. */
-function renderPages(el,doc){
+function renderPages(el,doc,keepScroll){
+  const sc=keepScroll?el.scrollTop:0;
   el.innerHTML='';
   el.appendChild(zoomBar(el));
+  const hits=(doc&&doc.hits)||[],ex=new Set((doc&&doc.excluded)||[]);
+  if(hits.length){
+    const hint=document.createElement('div');hint.className='hithint';
+    hint.textContent=tt('t_hit_hint');
+    el.appendChild(hint);
+  }
   for(let i=0;i<doc.n_pages;i++){
     const pg=document.createElement('div');pg.className='pg';
     const im=document.createElement('img');
     im.loading='lazy';im.alt=(i+1)+' / '+doc.n_pages;   // alt = pagina: se il render manca si vede quale
-    im.src=`/doc/${doc.doc_id}/page/${i}.png`;
+    // la versione (?v=) evita che il browser mostri la pagina vecchia dopo
+    // che una copertura e' stata annullata e il PDF rigenerato
+    im.src=`/doc/${doc.doc_id}/page/${i}.png${doc.v?'?v='+doc.v:''}`;
     pg.appendChild(im);
+    // le caselle cliccabili: un click annulla la copertura di una PII coperta
+    // per errore (il server rigenera il PDF senza quella occorrenza)
+    for(const h of hits){
+      if(h.page!==i||!h.w||!h.h)continue;
+      const off=ex.has(h.id);
+      for(const r of (h.rects||[])){
+        const ov=document.createElement('div');
+        ov.className='hit'+(off?' off':'');
+        ov.style.left=(r[0]/h.w*100)+'%';
+        ov.style.top=(r[1]/h.h*100)+'%';
+        ov.style.width=Math.max(0.4,(r[2]-r[0])/h.w*100)+'%';
+        ov.style.height=Math.max(0.4,(r[3]-r[1])/h.h*100)+'%';
+        ov.title=(off?tt('t_hit_restore'):tt('t_hit_cancel'))+' · '+h.placeholder;
+        ov.onclick=()=>toggleHit(h.id);
+        pg.appendChild(ov);
+      }
+    }
     const n=document.createElement('span');n.className='pgn';
     n.textContent=(i+1)+' / '+doc.n_pages;pg.appendChild(n);
     el.appendChild(pg);
   }
-  el.scrollTop=0;
+  el.scrollTop=sc;
+}
+
+/* Annulla (o ripristina) la copertura di una singola PII dall'anteprima.
+   Il server rigenera il PDF con quella occorrenza esclusa: la PII torna in
+   chiaro e il documento viene segnalato come "valori rimasti in chiaro". */
+let HIT_BUSY=false;
+async function toggleHit(id){
+  if(!OUT_DOC||HIT_BUSY)return;
+  const set=new Set(OUT_DOC.excluded||[]);
+  const wasOff=set.has(id);
+  wasOff?set.delete(id):set.add(id);
+  HIT_BUSY=true;
+  try{
+    const r=await fetch(`/doc/${OUT_DOC.doc_id}/redactions`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({excluded:[...set]})});
+    const d=await r.json();
+    if(!r.ok){toast(d.error||tt('t_error'),false,5000);return;}
+    const prima=(OUT_DOC.redactions||0);
+    Object.assign(OUT_DOC,d);
+    renderPages($('pdfOutView'),OUT_DOC,true);
+    toast(wasOff?tt('t_hit_on'):tt('t_hit_off'),wasOff,4000);
+    if((OUT_DOC.residual||0)>0)toast(T[L].t_hit_warn(OUT_DOC.residual),false,9000);
+    else if((OUT_DOC.redactions||0)!==prima)toast(tt('t_hit_done'),true,3000);
+  }catch(e){toast(tt('t_error')+': '+e.message,false);}
+  finally{HIT_BUSY=false;}
 }
 
 /* barra zoom (issue #92): +/- e reset sulla %, piu' ctrl/cmd+rotellina sull'intera vista.
