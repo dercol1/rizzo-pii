@@ -24,7 +24,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "deb", "rpm", "appimage"],
     "publisher": "Rizzo AI",
     "copyright": "© Rizzo AI",
     "category": "Productivity",

@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Build dell'app desktop Rizzo PII per LINUX (.deb + .AppImage), CPU/offline.
+# Build dell'app desktop Rizzo PII per LINUX (.deb/.rpm/.AppImage), CPU/offline.
 #
 # NON si compila da Windows: PyInstaller e i bundle Tauri Linux (webkit2gtk)
-# vanno costruiti SU Linux. Lancia questo script su Ubuntu/Debian o in WSL2.
+# vanno costruiti SU Linux. Lancia questo script su Ubuntu/Debian/Fedora/openSUSE o in WSL2.
 #
 # Speculare a docs/BUILD.md (Windows): stesso build_sidecar.spec, ma qui il
-# sidecar esce come 'pii-backend' (senza .exe) e i bundle sono deb/appimage.
+# sidecar esce come 'pii-backend' (senza .exe) e i bundle sono deb/rpm/appimage.
 # Il Rust (lib.rs) sceglie il nome del binario in base al SO (cfg!(windows)).
 #
 # Uso:
-#   bash build_linux.sh
+#   bash build_linux.sh          # tutti e tre: deb, rpm, appimage
+#   bash build_linux.sh deb      # solo .deb
+#   bash build_linux.sh rpm      # solo .rpm
+#   bash build_linux.sh appimage # solo .AppImage
 #
-# Prerequisiti di sistema (una volta, Ubuntu 22.04/24.04):
-#   sudo apt update && sudo apt install -y \
-#     build-essential curl wget file libssl-dev libxdo-dev patchelf \
-#     libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev
+# Prerequisiti di sistema (una volta):
+#   Ubuntu/Debian:
+#     sudo apt update && sudo apt install -y \
+#       build-essential curl wget file libssl-dev libxdo-dev patchelf \
+#       libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev rpm
+#   Fedora/RHEL:
+#     sudo dnf install -y gcc gcc-c++ make curl wget file openssl-devel patchelf \
+#       webkit2gtk4.1-devel librsvg2-devel libappindicator-gtk3-devel rpm-build
+#   openSUSE:
+#     sudo zypper install -y gcc gcc-c++ make curl wget file libopenssl-devel patchelf \
+#       webkit2gtk-4_1-devel librsvg-devel libappindicator3-devel rpm-build
 #   # + Rust (https://rustup.rs) e Node.js 18+ (con npm)
 # ============================================================================
 set -euo pipefail
@@ -24,8 +34,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 MODEL_DIR="models/rizzo-pii-0.3B-v1.5.0"   # deve combaciare con build_sidecar.spec
-VENV="${VENV:-build_env_linux}"            # override: in Docker si usa il venv gia' nell'immagine
-BUNDLES="${*:-deb appimage}"               # bundle da produrre (es. "bash build_linux.sh deb")
+VENV="${VENV:-build_env_linux}"            # override: in Docker si usa il venv già nell'immagine
+BUNDLES="${*:-deb rpm appimage}"           # bundle da produrre (es. "bash build_linux.sh deb")
 
 # ---- 0) controlli ----------------------------------------------------------
 [ -d "$MODEL_DIR" ] || { echo "ERRORE: modello mancante: $MODEL_DIR (copialo qui)"; exit 1; }
@@ -46,12 +56,17 @@ fi
 [ -f tauri/src-tauri/backend/pii-backend/pii-backend ] \
   || { echo "ERRORE: sidecar Linux non prodotto"; exit 1; }
 
-# ---- 3) build Tauri: override bundle a deb + appimage (la conf di default e' nsis) ----
+# ---- 3) build Tauri: override bundle a deb + rpm + appimage (la conf di default è nsis) ----
 cd tauri
 npm install
 npx tauri build --bundles $BUNDLES
 
 echo
 echo "FATTO. Artefatti Linux in:"
-echo "  tauri/src-tauri/target/release/bundle/deb/*.deb"
-echo "  tauri/src-tauri/target/release/bundle/appimage/*.AppImage"
+for b in $BUNDLES; do
+  case "$b" in
+    deb)      echo "  tauri/src-tauri/target/release/bundle/deb/*.deb" ;;
+    rpm)      echo "  tauri/src-tauri/target/release/bundle/rpm/*.rpm" ;;
+    appimage) echo "  tauri/src-tauri/target/release/bundle/appimage/*.AppImage" ;;
+  esac
+done

@@ -2,7 +2,7 @@
 
 Crea un eseguibile/installer **standalone e offline** dell'anonimizzatore PII.
 Usa una build **CPU di PyTorch** (gira su qualsiasi PC, niente CUDA richiesta).
-Windows: vedi sotto. **Linux** (.deb/.AppImage): vedi **[§ Build Linux](#build-linux-debappimage)**.
+Windows: vedi sotto. **Linux** (.deb/.rpm/.AppImage): vedi **[§ Build Linux](#build-linux-debappimage)**.
 **macOS** (.app/.dmg): vedi **[§ Build macOS](#build-macos-appdmg)**.
 
 Esistono due modi di impacchettare, entrambi CPU/offline:
@@ -97,26 +97,56 @@ Accortezze:
 
 ---
 
-## Build Linux (.deb/.AppImage)
+## Build Linux (.deb/.rpm/.AppImage)
 
 **Non si compila da Windows** (PyInstaller e i bundle Tauri Linux/`webkit2gtk` vanno fatti su
-Linux). Usa una macchina Ubuntu/Debian o **WSL2**. Tutto è automatizzato in **`build_linux.sh`**
+Linux). Usa una macchina Ubuntu/Debian/Fedora/openSUSE o **WSL2**. Tutto è automatizzato in **`build_linux.sh`**
 (root): stesso `build_sidecar.spec`, ma il sidecar esce come `pii-backend` (senza `.exe`) e i
-bundle sono `deb`/`appimage`. Il Rust ([`lib.rs`](../tauri/src-tauri/src/lib.rs)) sceglie già il
+bundle sono `deb`/`rpm`/`appimage`. Il Rust ([`lib.rs`](../tauri/src-tauri/src/lib.rs)) sceglie già il
 nome del binario in base al SO (`cfg!(windows)`).
 
+### Prerequisiti di sistema (una volta)
+
+**Debian/Ubuntu:**
 ```bash
-# prerequisiti di sistema (una volta)
 sudo apt update && sudo apt install -y \
   build-essential curl wget file libssl-dev libxdo-dev patchelf \
-  libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev
+  libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev rpm
 # + Rust (https://rustup.rs) e Node.js 18+
+```
 
-# copia il modello addestrato sulla macchina Linux in models/rizzo-pii-0.3B-v1.2.0/
+**Fedora/RHEL/CentOS:**
+```bash
+sudo dnf install -y \
+  gcc gcc-c++ make curl wget file openssl-devel patchelf \
+  webkit2gtk4.1-devel librsvg2-devel libappindicator-gtk3-devel rpm-build
+# + Rust (https://rustup.rs) e Node.js 18+
+```
+
+**openSUSE:**
+```bash
+sudo zypper install -y \
+  gcc gcc-c++ make curl wget file libopenssl-devel patchelf \
+  webkit2gtk-4_1-devel librsvg-devel libappindicator3-devel rpm-build
+# + Rust (https://rustup.rs) e Node.js 18+
+```
+
+### Build nativa (diretta sulla macchina Linux)
+
+```bash
+# copia il modello addestrato in models/rizzo-pii-0.3B-v1.5.0/
 bash build_linux.sh
 ```
-Output: `tauri/src-tauri/target/release/bundle/{deb/*.deb, appimage/*.AppImage}`. Il modello è
+Output: `tauri/src-tauri/target/release/bundle/{deb/*.deb, rpm/*.rpm, appimage/*.AppImage}`. Il modello è
 gitignorato (~1,23 GB): va copiato a mano sulla macchina Linux, non è nel repo.
+
+Opzioni dello script:
+```bash
+bash build_linux.sh deb      # solo .deb
+bash build_linux.sh rpm      # solo .rpm
+bash build_linux.sh appimage # solo .AppImage
+bash build_linux.sh          # tutti e tre (default)
+```
 
 ### Con Docker (consigliato: riproducibile, non sporca il sistema)
 
@@ -134,9 +164,81 @@ docker run --rm -e VENV=/opt/venv -e APPIMAGE_EXTRACT_AND_RUN=1 \
 ```
 - L'immagine si ricostruisce solo se cambiano le dipendenze; le build successive sono veloci.
 - Se l'**AppImage** fallisce nel container (FUSE): `... rizzo-pii-builder bash build_linux.sh deb`
-  produce solo il `.deb`.
+  produce solo il `.deb` (o `rpm`).
 - **Velocità**: buildare sul mount `/mnt/d` (filesystem Windows) è lento. Per build ripetute,
   `rsync` i sorgenti + il modello in `~/` dentro WSL e monta quella copia.
+
+### Avvio da sorgente (senza build, per sviluppo/test rapido)
+
+Non serve compilare: l'app gira direttamente da sorgente Python.
+
+```bash
+git clone https://github.com/Rizzo-AI-Academy/rizzo-pii
+cd rizzo-pii
+
+# 1. Venv + dipendenze CPU
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt        # torch CPU è ok
+
+# 2. Scarica il modello (la cartella deve matchare APP_MODEL_VERSION in app.py)
+hf download rizzoaiacademy/rizzo-pii-0.3B --revision v1.5.0 \
+  --local-dir models/rizzo-pii-0.3B-v1.5.0
+
+# 3. Avvia il server Flask (backend)
+python src/app/app.py                  # -> http://127.0.0.1:5005
+# oppure headless (per Tauri dev):
+python src/app/serve.py                # stesso, niente browser
+
+# 4. (Opzionale) Avvia frontend Tauri in dev mode (hot reload Rust + UI)
+cd tauri && npm install && npx tauri dev
+```
+
+**Vantaggi**: niente PyInstaller, niente Rust compile in produzione, iterazione veloce su Python/HTML/JS. Il backend usa lo stesso codice della build finale.
+
+### Packaging RPM manuale (senza Tauri)
+
+Se vuoi solo un `.rpm` del backend Python (senza finestra Tauri), puoi usare `fpm` o `rpmbuild` sull'output di PyInstaller:
+
+```bash
+# 1. Build sidecar PyInstaller (stesso spec di Tauri)
+python -m venv build_env
+build_env/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+build_env/bin/pip install transformers==4.57.3 tokenizers safetensors flask pymupdf pyinstaller
+build_env/bin/pyinstaller build_sidecar.spec --noconfirm --distpath dist/linux_sidecar
+
+# 2. Crea spec RPM
+cat > rizzo-pii-backend.spec <<'EOF'
+Name:           rizzo-pii-backend
+Version:        2.0.0
+Release:        1%{?dist}
+Summary:        Local PII anonymization backend (CPU)
+License:        AGPL-3.0
+URL:            https://github.com/Rizzo-AI-Academy/rizzo-pii
+Source0:        %{name}-%{version}.tar.gz
+
+%description
+CPU-only backend for rizzo-pii PII anonymization. Includes mmBERT model (~0.3B params).
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%install
+mkdir -p %{buildroot}/opt/rizzo-pii
+cp -r pii-backend/* %{buildroot}/opt/rizzo-pii/
+install -Dm755 %{SOURCE1} %{buildroot}/usr/bin/rizzo-pii-backend
+
+%files
+/opt/rizzo-pii/
+/usr/bin/rizzo-pii-backend
+
+%changelog
+EOF
+
+# 3. Pacchetta
+tar -czf rizzo-pii-backend-2.0.0.tar.gz -C dist/linux_sidecar pii-backend
+rpmbuild -ta rizzo-pii-backend-2.0.0.tar.gz
+# Output: ~/rpmbuild/RPMS/x86_64/rizzo-pii-backend-2.0.0-1.x86_64.rpm
+```
 
 ---
 

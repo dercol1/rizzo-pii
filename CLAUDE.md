@@ -3,9 +3,10 @@
 Guida per Claude Code (claude.ai/code) quando lavora in questa repo. Panoramica e struttura
 delle cartelle in **[README.md](README.md)**. Documenti di dettaglio:
 **[docs/TASSONOMIA_TAG.md](docs/TASSONOMIA_TAG.md)** (i 22 tag),
-**[docs/DATASET.md](docs/DATASET.md)** (composizione completa di train/validation) e
+**[docs/DATASET.md](docs/DATASET.md)** (composizione completa di train/validation),
 **[docs/TRAINING.md](docs/TRAINING.md)** (unione dei due dataset HF, accortezze sui tag,
-iperparametri).
+iperparametri),
+**[docs/DEVELOPMENT_MANUAL.md](docs/DEVELOPMENT_MANUAL.md)** (manuale completo sviluppo: architettura, pipeline dati, training, app, API, regex/checksum, PDF redaction, Tauri, testing, build, **estrazione zone PII per OCR**).
 
 ## Cos'è questo progetto
 
@@ -282,3 +283,14 @@ python src/inspect/inspect_lengths.py
 - **Valori off-domain di DeepMount**: nomi/indirizzi USA; utili per forma/contesto, non come
   valori italiani.
 - In produzione affiancare **sempre** la rete regex+checksum (`src/inspect/validate_checksums.py`) al modello.
+
+<!-- rtk-instructions v2 -->
+# Command output
+
+Command output here is condensed to save tokens, keeping every signal and
+dropping costly noise. Treat it as the complete result: run commands
+normally, and batch related commands into one call to avoid extra turns.
+Truncated results state their recovery path in their own output. Re-run a
+command as `rtk bypass <cmd>` only when its result is unusable: empty when
+output was clearly expected, contradicting its exit code, or garbled.
+<!-- /rtk-instructions -->

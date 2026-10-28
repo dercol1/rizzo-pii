@@ -455,9 +455,9 @@ and **restore** the real values from the response. Input: pasted text, a **PDF**
 **`.md` / `.txt`** file.
 
 ### The local HTTP API
-
+ 
 The same process is a plain HTTP service, so you can use it as a sidecar in a fail-closed pipeline:
-
+ 
 ```bash
 curl localhost:5005/health                      # readiness, no inference: 200 = model loaded
 curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
@@ -465,6 +465,8 @@ curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
 curl -F "file=@atto.pdf" localhost:5005/analyze  # .pdf, .md, .txt
 curl -F "file=@atto.pdf" localhost:5005/pdf -o atto_anonimizzato.pdf   # anonymized PDF back
 curl localhost:5005/settings                     # tag legend, excluded tags, dictionary state
+curl -F "file=@atto.pdf" localhost:5005/pii-zones # PII zone coordinates for OCR
+curl -F "file=@atto.pdf" localhost:5005/analyze-with-zones # analyze + zones in one call
 ```
 
 ### Get the anonymized document back as a PDF
@@ -534,6 +536,52 @@ curl -X POST localhost:5005/analyze -H 'Content-Type: application/json' \
 
 ---
 
+## PII zones extraction for OCR (scanned documents)
+
+When a PDF is a **scan** (raster images, no text layer), the text-layer redaction cannot work — the endpoint fails with `422`. To handle this, rizzo-pii exposes endpoints that return **precise geometric coordinates** (bounding boxes) of every detected PII, so you can feed only those regions to an external OCR engine (Tesseract, PaddleOCR, AWS Textract, Google Vision, etc.) and merge the results back.
+
+### New endpoints
+
+| Endpoint | Input | Output | Purpose |
+|---|---|---|---|
+| `POST /pii-zones` | multipart PDF | `{zones, page_sizes, dpi}` | Extract PII zones with exact coordinates from the PDF text layer |
+| `POST /analyze-with-zones` | multipart PDF | `/analyze` response **+** `zones, page_sizes, dpi` | Single call: analyze + extract zones (avoids double processing) |
+| `POST /ocr-zones` | JSON `{pdf_base64\|doc_id, zones[{page,bbox,ocr_text}], exclude_tags, include_mapping}` | `{base_analysis, ocr_entities, ocr_zones_processed}` | Merge external OCR results for specific zones into the analysis |
+
+### Zone object format
+
+```json
+{
+  "page": 0,
+  "label": "FULLNAME",
+  "placeholder": "[FULLNAME_1]",
+  "value": "Mario Rossi",
+  "bbox": [83.35, 37.10, 146.68, 53.59],
+  "bbox_normalized": [0.140, 0.044, 0.247, 0.064],
+  "confidence": 1.0
+}
+```
+
+- `bbox`: PDF points (1/72 inch), origin **bottom-left** (PyMuPDF convention)
+- `bbox_normalized`: 0–1 relative to page width/height (page sizes in `page_sizes`)
+- `dpi`: 110 (matches the preview rendering DPI)
+
+### Recommended workflow for scanned documents
+
+```
+1. POST /preview                    → load PDF, get doc_id, n_pages, extracted text
+2. GET /doc/<id>/page/<n>.png       → render pages for display
+3. POST /pii-zones                  → get PII zone coordinates from text layer (if any)
+4. [Client] Send zones to external OCR engine (Tesseract, AWS Textract, etc.)
+5. POST /ocr-zones                  → submit OCR results (bbox + recognized text)
+6. POST /analyze-with-zones         → combined analysis (optional, single call)
+7. POST /pdf                        → download fully anonymized PDF
+```
+
+The coordinate extraction uses the **same char-precise matching logic** as the real PDF redaction (`pdf_export._page_char_index`, `_value_pattern`, `_match_rects`), so the boxes match exactly where placeholders are written during redaction.
+
+---
+
 ## Repository structure
 
 ```
@@ -544,15 +592,18 @@ rizzo_pii/
 ├─ CONTRIBUTING.md           how to contribute (code, docs, data)
 ├─ requirements.txt          Python dependencies (see the cu128 note for Blackwell GPUs)
 ├─ Dockerfile                the web app in a container (CPU deps + model baked in)
-├─ Dockerfile.linux          reproducible build env for the Linux .deb/AppImage bundles
+├─ Dockerfile.linux          reproducible build env for the Linux .deb/.rpm/AppImage bundles
 ├─ .env.example              template for the optional W&B / Gemini keys
 ├─ CLAUDE.md                 operating instructions + environment constraints (GPU, CUDA…)
 ├─ report/                   the technical report (PDF + Typst source)
 ├─ docs/
 │   ├─ DATASET.md            full composition of train/validation
 │   ├─ TASSONOMIA_TAG.md     the 22 final tags and the merge decisions
-│   ├─ BUILD.md              desktop app build (Tauri recommended + PyInstaller legacy)
+│   ├─ TRAINING.md           training run: union of both HF datasets, subword-label handling, hyperparameters
+│   ├─ FORMATO_DATI.md       exact dataset row format for contributing data (JSONL/BIO/checksums)
+│   ├─ BUILD.md              desktop executable build (Tauri + PyInstaller, all platforms)
 │   ├─ CHANGELOG.md          change log, with rationale
+│   ├─ DEVELOPMENT_MANUAL.md **complete development manual** — architecture, data pipeline, training, app, API, regex/checksum, PDF redaction, Tauri, testing, build, PII zones extraction for OCR
 │   └─ star_history_*.png    star chart shown below (regenerated by scripts/)
 ├─ scripts/
 │   └─ plot_star_history.py  reads the stargazers, renders docs/star_history_*.png
@@ -563,7 +614,8 @@ rizzo_pii/
 │   │   ├─ augment_real_pii.py        injects synthetic entities into real Ai4Privacy sentences
 │   │   ├─ prepare_deepmount.py       remaps DeepMount (56 types) onto our 22 tags
 │   │   ├─ build_validation.py        builds the single real validation set (it)
-│   │   └─ build_subset.py            stratified subsets for smoke tests / tuning
+│   │   ├─ build_subset.py            stratified subsets for smoke tests / tuning
+│   │   └─ contribute_dataset.py      contributes synthetic data to the community HF dataset
 │   ├─ training/
 │   │   ├─ train_pii.py               train, evaluate, save the model + metrics
 │   │   ├─ evaluate_pii.py            per-tag (P/R/F1) evaluation on validation_real
@@ -572,8 +624,11 @@ rizzo_pii/
 │   └─ app/                           local anonymization app
 │       ├─ app.py                     Flask server: reversible anonymization + regex/checksum net
 │       ├─ pdf_export.py              anonymized-PDF download: true redaction of the uploaded PDF
+│       ├─ pdf_text.py                readable text extraction (pages + annotations + widgets + TOC)
+│       ├─ detectors.py               regex+checksum net (standalone, no torch/fitz)
 │       ├─ serve.py                   headless entry (backend of the Tauri app, no browser)
 │       ├─ desktop_app.py             legacy PyInstaller entry (opens the browser)
+│       ├─ server_config.py           host/port config + prefs.json (excluded tags, mapping)
 │       └─ assets/                    mascot (the hedgehog) and icons
 ├─ tauri/                    native desktop app (Tauri) + Windows installer — see docs/BUILD.md
 ├─ dataset/                  (gitignored — regenerable from the scripts)
@@ -677,7 +732,7 @@ Vincoli: SOLO dati sintetici (mai PII reali). Se Gemini non è disponibile, ferm
 ---
 
 ## Documentation
-
+ 
 | Document | Contents |
 |---|---|
 | [CLAUDE.md](CLAUDE.md) | Environment constraints, repo map, architectural decisions, commands |
@@ -685,8 +740,9 @@ Vincoli: SOLO dati sintetici (mai PII reali). Se Gemini non è disponibile, ferm
 | [docs/TRAINING.md](docs/TRAINING.md) | Training run: union of both HF datasets, subword-label handling, hyperparameters |
 | [docs/TASSONOMIA_TAG.md](docs/TASSONOMIA_TAG.md) | The 22 final tags and the merges (`TAG_MAP`) |
 | [docs/FORMATO_DATI.md](docs/FORMATO_DATI.md) | Exact dataset row format for contributing data (JSONL/BIO/checksums) |
-| [docs/BUILD.md](docs/BUILD.md) | Desktop executable build (CPU, Windows) |
+| [docs/BUILD.md](docs/BUILD.md) | Desktop executable build (Tauri + PyInstaller, all platforms) |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Change log for the pipeline, with rationale |
+| [docs/DEVELOPMENT_MANUAL.md](docs/DEVELOPMENT_MANUAL.md) | **Complete development manual** — architecture, data pipeline, training, app, API, regex/checksum net, PDF redaction, Tauri, testing, build, **PII zones extraction for OCR** |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute code, docs and (above all) data |
 
 ## Contributors

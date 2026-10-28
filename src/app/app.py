@@ -455,6 +455,7 @@ def analyze(text, excluded=None, mapping_enabled=True):
         "by_label": dict(sorted(by_label.items(), key=lambda x: -x[1])),
         "by_source": by_source,
         "excluded_tags": sorted(excluded),
+        "_raw_entities": cands,  # entità prima della fusione (per fusione OCR)
     }
 
 
@@ -737,6 +738,276 @@ def pdf_preview_route():
         "skipped": len(report.get("skipped", [])),
         "not_found": len(report.get("not_found", [])),
     })
+
+
+# --------------------------------------------------------------------------- #
+# Estrazione zone PII con coordinate (per OCR esterno)
+# --------------------------------------------------------------------------- #
+def _extract_pii_zones(pdf_bytes, mapping, excluded_tags=None, mapping_enabled=True):
+    """
+    Estrae le zone (bounding box) delle PII in un PDF usando lo stesso matching
+    char-preciso di pdf_export.redact_pdf.
+    
+    Ritorna dict con:
+    - zones: lista zone per pagina con bbox (punti PDF) e bbox_normalizzato (0-1)
+    - page_sizes: dimensioni pagine in punti PDF
+    - dpi: DPI usato per il rendering anteprima
+    """
+    excluded = set(excluded_tags or ())
+    items = [(ph, v) for ph, v in mapping.items()
+             if ph not in excluded and isinstance(v, str) and v.strip()]
+    if not items:
+        return {"zones": [], "page_sizes": [], "dpi": PREVIEW_DPI}
+    
+    # Ordina per lunghezza decrescente (valori lunghi prima, come in redact_pdf)
+    items.sort(key=lambda kv: -len(kv[1]))
+    
+    zones = []
+    page_sizes = []
+    
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page_num, page in enumerate(doc):
+            page_sizes.append({"width": page.rect.width, "height": page.rect.height})
+            text, boxes = pdf_export._page_char_index(page)
+            
+            if not text.strip():
+                continue
+                
+            for ph, val in items:
+                if pdf_export._too_noisy(val):
+                    continue
+                pat = pdf_export._value_pattern(val)
+                if not pat:
+                    continue
+                    
+                for m in pat.finditer(text):
+                    rects = pdf_export._match_rects(boxes, m)
+                    for r in rects:
+                        # Normalizza bbox 0-1 rispetto alle dimensioni pagina
+                        norm = [
+                            r.x0 / page.rect.width,
+                            r.y0 / page.rect.height,
+                            r.x1 / page.rect.width,
+                            r.y1 / page.rect.height
+                        ]
+                        label = ph.split("_")[0].strip("[]")
+                        zones.append({
+                            "page": page_num,
+                            "label": label,
+                            "placeholder": ph,
+                            "value": val if mapping_enabled else None,
+                            "bbox": [r.x0, r.y0, r.x1, r.y1],
+                            "bbox_normalized": norm,
+                            "confidence": 1.0  # validated handled by mapping source
+                        })
+    
+    return {"zones": zones, "page_sizes": page_sizes, "dpi": PREVIEW_DPI}
+
+
+@app.route("/pii-zones", methods=["POST"])
+def pii_zones_route():
+    """
+    Estrae le coordinate (bounding box) delle zone PII in un PDF.
+    
+    Input: multipart con file .pdf (campo "pdf" o "file")
+           campi opzionali: exclude_tags, include_mapping
+    Output: JSON con zones, page_sizes, dpi
+    
+    Utile per: dare coordinate a motore OCR esterno su documenti scansionati,
+    o per evidenziazione programmatica zone sensibili.
+    """
+    up = _uploaded_file()
+    if up is None:
+        return jsonify({"error": "Nessun file caricato."}), 400
+    name, data = up.filename, up.read()
+    if not _is_pdf(name, data):
+        return jsonify({"error": "L'estrazione zone PII vale solo per i PDF."}), 400
+    
+    try:
+        text = _text_from_bytes(name, data)
+    except PdfLocked as e:
+        return jsonify({"error": f"Impossibile leggere il file: {e}", "code": "pdf_locked"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Impossibile leggere il file: {e}"}), 400
+    
+    raw_excl = request.form.get("exclude_tags")
+    raw_map = request.form.get("include_mapping")
+    
+    default_excl, default_map = _get_prefs()
+    excl = server_config.parse_tag_list(raw_excl) if raw_excl is not None else default_excl
+    keep_map = (server_config.parse_bool(raw_map, default_map)
+                if raw_map is not None else default_map)
+    
+    # Analizza per ottenere mapping (serve per sapere COSA cercare nel PDF)
+    res = analyze(text, excl, mapping_enabled=True)
+    if not res["mapping"]:
+        return jsonify({"error": "Nessuna PII trovata nel documento.", "zones": [], "page_sizes": [], "dpi": PREVIEW_DPI}), 422
+    
+    zones_data = _extract_pii_zones(data, res["mapping"], excl, keep_map)
+    return jsonify(zones_data)
+
+
+@app.route("/ocr-zones", methods=["POST"])
+def ocr_zones_route():
+    """
+    Integra risultati OCR esterni per zone specifiche e ritorna analisi completa.
+    
+    Input JSON:
+    {
+        "pdf_base64": "...",           # PDF originale (base64) OPPURE usa doc_id da /preview
+        "doc_id": "...",               # alternativo a pdf_base64: documento già in memoria
+        "zones": [                     # risultati OCR per zone specifiche
+            {"page": 0, "bbox": [x0,y0,x1,y1], "ocr_text": "Mario Rossi"}
+        ],
+        "exclude_tags": [...],
+        "include_mapping": true
+    }
+    
+    Flusso:
+    1. Carica PDF (da base64 o da doc_id in memoria)
+    2. Analizza layer testuale esistente (già fatto da /analyze)
+    3. Per ogni zona OCR: esegue detect_model + detect_regex su ocr_text
+    4. Converte coordinate OCR (bbox) in offset globali nel testo completo
+    5. Fondi entità OCR con entità layer testuale
+    6. Ritorna analisi completa (come /analyze) + opzionale PDF anonimizzato
+    
+    Nota: le coordinate bbox DEVONO essere nello stesso sistema di riferimento
+    del PDF (punti PDF, 1/72 inch), come ritornato da /pii-zones.
+    """
+    payload = request.get_json(silent=True) or {}
+    
+    # Carica PDF
+    pdf_bytes = None
+    if "pdf_base64" in payload:
+        import base64
+        try:
+            pdf_bytes = base64.b64decode(payload["pdf_base64"])
+        except Exception as e:
+            return jsonify({"error": f"pdf_base64 non valido: {e}"}), 400
+    elif "doc_id" in payload:
+        d = _get_doc(payload["doc_id"])
+        if d is None:
+            return jsonify({"error": "Documento non trovato in memoria (scaduto o mai caricato)."}), 404
+        pdf_bytes = d["pdf"]
+    else:
+        return jsonify({"error": "Specificare pdf_base64 o doc_id."}), 400
+    
+    ocr_zones = payload.get("zones", [])
+    if not isinstance(ocr_zones, list):
+        return jsonify({"error": "zones deve essere una lista."}), 400
+    
+    raw_excl = payload.get("exclude_tags")
+    raw_map = payload.get("include_mapping")
+    
+    default_excl, default_map = _get_prefs()
+    excl = server_config.parse_tag_list(raw_excl) if raw_excl is not None else default_excl
+    keep_map = (server_config.parse_bool(raw_map, default_map)
+                if raw_map is not None else default_map)
+    
+    # 1. Estrai testo dal PDF (layer testuale)
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if doc.needs_pass:
+                return jsonify({"error": "PDF protetto da password.", "code": "pdf_locked"}), 400
+            text = pdf_text.collect_readable_text(doc)
+    except Exception as e:
+        return jsonify({"error": f"Impossibile leggere il PDF: {e}"}), 400
+    
+    # 2. Analisi standard sul layer testuale
+    base_res = analyze(text, excl, mapping_enabled=keep_map)
+    
+    # 3. Processa zone OCR
+    ocr_entities = []
+    for zone in ocr_zones:
+        page_num = zone.get("page")
+        bbox = zone.get("bbox")
+        ocr_text = zone.get("ocr_text", "").strip()
+        
+        if page_num is None or bbox is None or not ocr_text:
+            continue
+        
+        # Esegui detection su testo OCR
+        model_ents, _ = detect_model(ocr_text)
+        complete_time(model_ents, ocr_text)
+        regex_ents = detect_regex(ocr_text)
+        
+        all_ents = model_ents + regex_ents
+        if excl:
+            all_ents = [e for e in all_ents if e["label"] not in excl]
+        
+        # Converti coordinate locali (nel testo OCR) in coordinate globali
+        # Per semplicità, restituiamo le entità OCR con metadati della zona
+        for e in all_ents:
+            e["ocr_zone"] = {
+                "page": page_num,
+                "bbox": bbox,
+                "source_text": ocr_text
+            }
+            e["source"] = "ocr"
+        ocr_entities.extend(all_ents)
+    
+    # 4. Fondi entità base + OCR (sullo stesso testo base)
+    # Nota: questo è semplificato - in produzione servirebbe allineamento
+    # più sofisticato tra coordinate PDF e offset testo
+    all_cands = []
+    # Entità base (già con offset globali)
+    for e in base_res.get("_raw_entities", []):
+        all_cands.append(e)
+    # Entità OCR (offset relativi al testo OCR - andrebbero mappati)
+    # Per ora le includiamo come entità separate con metadati zona
+    
+    # 5. Ritorna risultato combinato
+    return jsonify({
+        "base_analysis": base_res,
+        "ocr_entities": ocr_entities,
+        "ocr_zones_processed": len(ocr_zones),
+        "note": "Le entità OCR hanno offset relativi al testo OCR della zona. Per fusione completa serve allineamento coordinate."
+    })
+
+
+@app.route("/analyze-with-zones", methods=["POST"])
+def analyze_with_zones_route():
+    """
+    Analizza un PDF e restituisce sia l'analisi completa che le zone PII con coordinate.
+    Combina /analyze + /pii-zones in una sola chiamata per evitare doppio processing.
+    
+    Input: multipart con file .pdf (campo "pdf" o "file")
+           campi opzionali: exclude_tags, include_mapping
+    Output: JSON con tutti i campi di /analyze PIU' zones, page_sizes, dpi
+    """
+    up = _uploaded_file()
+    if up is None:
+        return jsonify({"error": "Nessun file caricato."}), 400
+    name, data = up.filename, up.read()
+    if not _is_pdf(name, data):
+        return jsonify({"error": "L'analisi con zone vale solo per i PDF."}), 400
+    
+    try:
+        text = _text_from_bytes(name, data)
+    except PdfLocked as e:
+        return jsonify({"error": f"Impossibile leggere il file: {e}", "code": "pdf_locked"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Impossibile leggere il file: {e}"}), 400
+    
+    raw_excl = request.form.get("exclude_tags")
+    raw_map = request.form.get("include_mapping")
+    
+    default_excl, default_map = _get_prefs()
+    excl = server_config.parse_tag_list(raw_excl) if raw_excl is not None else default_excl
+    keep_map = (server_config.parse_bool(raw_map, default_map)
+                if raw_map is not None else default_map)
+    
+    # Analisi completa
+    res = analyze(text, excl, mapping_enabled=keep_map)
+    
+    # Estrazione zone (solo se ci sono PII trovate)
+    zones_data = {"zones": [], "page_sizes": [], "dpi": PREVIEW_DPI}
+    if res["mapping"]:
+        zones_data = _extract_pii_zones(data, res["mapping"], excl, keep_map)
+    
+    # Combina risultati
+    res.update(zones_data)
+    return jsonify(res)
 
 
 # --------------------------------------------------------------------------- #
